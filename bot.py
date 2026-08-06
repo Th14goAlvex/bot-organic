@@ -66,6 +66,7 @@ CAMINHO_EVENTOS = os.getenv("CAMINHO_MOD_EVENTOS", os.path.join(CSV_BASE_PATH, "
 CAMINHO_PLAYERS_ONLINE = os.getenv("CAMINHO_MOD_PLAYERS_ONLINE", os.path.join(CSV_BASE_PATH, "online_players.csv"))
 CANAL_MORTES_ID = os.getenv("CANAL_MORTES_ID")
 CANAL_EVENTOS_ID = os.getenv("CANAL_EVENTOS_ID")
+CANAL_VIDAS_ID = os.getenv("CANAL_VIDAS_ID")
 NOME_CALL_INGAME = os.getenv("NOME_CALL_INGAME", "in-game")
 TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "120")))
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
@@ -99,6 +100,7 @@ ARQUIVO_HISTORICO_PERSONAGENS = os.path.join(BASE_DIR, "historico_personagens.js
 ARQUIVO_REGISTROS_PERSONAGENS = os.path.join(BASE_DIR, "registros_personagens.json")
 ARQUIVO_TEMPLATES = os.path.join(BASE_DIR, "templates_mensagens.json")
 ARQUIVO_FICHAS_EM_ANALISE = os.path.join(BASE_DIR, "fichas_em_analise.json")
+ARQUIVO_CONFIG_VIDAS = os.path.join(BASE_DIR, "config_vidas.json")
 
 ESPERA_ANALISE_FICHA_SEGUNDOS = 180
 
@@ -129,7 +131,9 @@ def _ler_json_arquivo(caminho):
     if not os.path.exists(caminho) or os.stat(caminho).st_size == 0:
         return None
     try:
-        with open(caminho, "r", encoding="utf-8") as f:
+        # utf-8-sig remove o BOM se existir (Bloco de Notas e PowerShell gravam
+        # com BOM) e funciona normalmente em arquivo sem BOM.
+        with open(caminho, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except UnicodeDecodeError:
         # Arquivos antigos podem ter sido gravados no encoding do Windows.
@@ -402,6 +406,118 @@ def carregar_registros_personagens():
 
 def salvar_registros_personagens(dados):
     salvar_json_seguro(ARQUIVO_REGISTROS_PERSONAGENS, dados, ensure_ascii=False)
+
+# --- SISTEMA DE VIDAS (limite de personagens por temporada) ---
+# Guardamos VIDAS USADAS, nunca vidas restantes. E isso que faz o limite ser
+# ajustavel sem resetar ninguem: se o limite sobe de 3 para 4, quem ja gastou 1
+# passa de 2 para 3 restantes automaticamente, sem precisar mexer em nada.
+
+CONFIG_VIDAS_PADRAO = {
+    "ilimitado": True,
+    "limite_vidas": 0,
+    "vidas_usadas": {},
+    "vidas_extras": {},
+}
+
+def carregar_config_vidas():
+    config = carregar_json_seguro(ARQUIVO_CONFIG_VIDAS, {})
+    if not isinstance(config, dict):
+        config = {}
+
+    resultado = dict(CONFIG_VIDAS_PADRAO)
+    resultado.update(config)
+    resultado["ilimitado"] = bool(resultado.get("ilimitado", True))
+    resultado["limite_vidas"] = max(0, int(resultado.get("limite_vidas") or 0))
+    for chave in ("vidas_usadas", "vidas_extras"):
+        valor = resultado.get(chave)
+        resultado[chave] = valor if isinstance(valor, dict) else {}
+    return resultado
+
+def salvar_config_vidas(config):
+    salvar_json_seguro(ARQUIVO_CONFIG_VIDAS, config, ensure_ascii=False)
+
+def vidas_usadas_jogador(user_id_str, config=None):
+    """Quantas recriacoes o jogador ja fez. Se nao houver contador gravado,
+    deduz do historico de personagens (o 1o personagem nao gasta vida)."""
+    config = config or carregar_config_vidas()
+    usadas = config.get("vidas_usadas", {})
+
+    if user_id_str in usadas:
+        with suppress(Exception):
+            return max(0, int(usadas[user_id_str]))
+
+    historico = carregar_historico_personagens().get(user_id_str) or []
+    return max(0, len(historico) - 1)
+
+def calcular_vidas(user_id_str):
+    """Retorna a situacao de vidas do jogador.
+    restantes = (limite da temporada + bonus manual) - vidas ja usadas"""
+    user_id_str = str(user_id_str)
+    config = carregar_config_vidas()
+    usadas = vidas_usadas_jogador(user_id_str, config)
+
+    if config["ilimitado"]:
+        return {"ilimitado": True, "usadas": usadas, "extras": 0,
+                "limite": 0, "total": 0, "restantes": None}
+
+    extras = 0
+    with suppress(Exception):
+        extras = int(config["vidas_extras"].get(user_id_str, 0))
+
+    total = max(0, config["limite_vidas"] + extras)
+    return {
+        "ilimitado": False,
+        "usadas": usadas,
+        "extras": extras,
+        "limite": config["limite_vidas"],
+        "total": total,
+        "restantes": max(0, total - usadas),
+    }
+
+def consumir_vida(user_id_str):
+    """Marca mais uma recriacao usada. Chamado so quando o registro foi
+    confirmado no servidor."""
+    user_id_str = str(user_id_str)
+    config = carregar_config_vidas()
+    config["vidas_usadas"][user_id_str] = vidas_usadas_jogador(user_id_str, config) + 1
+    salvar_config_vidas(config)
+    return calcular_vidas(user_id_str)
+
+def adicionar_vidas_extras(user_id_str, quantidade):
+    """Bonus manual da staff para um jogador especifico (aceita negativo)."""
+    user_id_str = str(user_id_str)
+    config = carregar_config_vidas()
+
+    atual = 0
+    with suppress(Exception):
+        atual = int(config["vidas_extras"].get(user_id_str, 0))
+
+    novo = atual + int(quantidade)
+    if novo:
+        config["vidas_extras"][user_id_str] = novo
+    else:
+        config["vidas_extras"].pop(user_id_str, None)
+
+    salvar_config_vidas(config)
+    return calcular_vidas(user_id_str)
+
+def jogador_pode_criar_personagem(user_id_str, tem_personagem_atual):
+    """O primeiro personagem da temporada nunca gasta vida e nunca e bloqueado."""
+    if not tem_personagem_atual:
+        return True, calcular_vidas(user_id_str)
+
+    vidas = calcular_vidas(user_id_str)
+    if vidas["ilimitado"]:
+        return True, vidas
+    return vidas["restantes"] > 0, vidas
+
+def texto_vidas_restantes(vidas):
+    if vidas["ilimitado"]:
+        return "♾ **Vidas ilimitadas** nesta temporada."
+    if vidas["restantes"] <= 0:
+        return "💀 **Você não tem mais vidas.** Este foi seu último personagem da temporada."
+    plural = "vida" if vidas["restantes"] == 1 else "vidas"
+    return f"❤ Você ainda tem **{vidas['restantes']} {plural}** (personagens que ainda pode criar depois deste)."
 
 def carregar_templates():
     return carregar_json_seguro(ARQUIVO_TEMPLATES, {})
@@ -1419,6 +1535,16 @@ class FichaModal(discord.ui.Modal, title="Ficha de Personagem"):
         if canal_tem_ficha_em_analise(interaction.channel.id):
             return await interaction.followup.send("⏳ **Você já tem uma ficha em análise neste ticket.** Aguarde o resultado antes de enviar outra.", ephemeral=True)
 
+        user_id_str = str(interaction.user.id)
+        tem_personagem = bool(carregar_personagens().get(user_id_str))
+        pode_criar, vidas = jogador_pode_criar_personagem(user_id_str, tem_personagem)
+        if not pode_criar:
+            return await interaction.followup.send(
+                f"💀 **Vidas esgotadas.** Você já usou todas as suas **{vidas['total']}** vidas desta temporada "
+                f"e não pode criar outro personagem. Fale com a staff neste ticket.",
+                ephemeral=True,
+            )
+
         # A senha NAO vai no resumo publico: fica so no arquivo de controle
         # e na DM de confirmacao no final do registro.
         embed = discord.Embed(
@@ -1454,6 +1580,50 @@ class FichaModal(discord.ui.Modal, title="Ficha de Personagem"):
                 await interaction.followup.send(mensagem, ephemeral=True)
             else:
                 await interaction.response.send_message(mensagem, ephemeral=True)
+
+async def enviar_painel_ficha(canal, membro):
+    """Mensagem de abertura do ticket de personagem: ja avisa quantas vidas o
+    jogador tem e so mostra o botao se ele ainda puder criar."""
+    user_id_str = str(membro.id)
+    tem_personagem = bool(carregar_personagens().get(user_id_str))
+    pode_criar, vidas = jogador_pode_criar_personagem(user_id_str, tem_personagem)
+
+    if not vidas["ilimitado"]:
+        if not tem_personagem:
+            situacao = (
+                f"❤ **Vidas desta temporada:** `{vidas['total']}`\n"
+                f"Este é o seu **primeiro personagem** — ele não gasta vida. "
+                f"Depois dele, você poderá recriar mais **{vidas['total']}** vez(es)."
+            )
+        else:
+            plural = "vida" if vidas["restantes"] == 1 else "vidas"
+            situacao = (
+                f"❤ **Vidas restantes:** `{vidas['restantes']}` {plural}\n"
+                f"*(já usou {vidas['usadas']} de {vidas['total']})*"
+            )
+    else:
+        situacao = "♾ **Vidas ilimitadas** nesta temporada."
+
+    if not pode_criar:
+        embed = discord.Embed(
+            title="💀 Vidas Esgotadas",
+            description=(
+                f"{membro.mention}, você já usou todas as suas **{vidas['total']}** vidas desta temporada "
+                f"e não pode criar outro personagem.\n\n"
+                f"Se achar que houve engano, aguarde o atendimento da staff aqui neste ticket."
+            ),
+            color=discord.Color.red(),
+        )
+        embed.set_footer(text="Staff: use /adicionar_vidas para liberar uma vida extra.")
+        return await canal.send(embed=embed)
+
+    return await canal.send(
+        f"{situacao}\n\n"
+        "📝 **Clique no botão abaixo para preencher sua ficha.**\n"
+        "O formulário abre uma janela com os campos separados — assim não tem risco de errar o formato.\n"
+        "*(Se preferir, você ainda pode digitar a ficha normalmente aqui no chat.)*",
+        view=FichaFormView(),
+    )
 
 class FichaFormView(discord.ui.View):
     """View persistente: continua funcionando depois de reiniciar o bot."""
@@ -1739,12 +1909,7 @@ class TicketButton(discord.ui.View):
 
         if categoria_processa_ficha_pos_morte(categoria):
             with suppress(Exception):
-                await canal_ticket.send(
-                    "📝 **Clique no botão abaixo para preencher sua ficha.**\n"
-                    "O formulário abre uma janela com os campos separados — assim não tem risco de errar o formato.\n"
-                    "*(Se preferir, você ainda pode digitar a ficha normalmente aqui no chat.)*",
-                    view=FichaFormView(),
-                )
+                await enviar_painel_ficha(canal_ticket, interaction.user)
 
 class ZomboidBot(commands.Bot):
     def __init__(self):
@@ -2154,6 +2319,44 @@ def agendar_processamento_fichas_pendentes():
         name="processar-fichas-pendentes",
     )
     return tarefa_fichas_pendentes
+
+async def registrar_log_vidas(membro, nome_personagem, vidas, primeiro_personagem):
+    """Publica no canal de vidas cada personagem novo criado."""
+    if not CANAL_VIDAS_ID:
+        return
+
+    canal = None
+    with suppress(Exception):
+        canal = bot.get_channel(int(CANAL_VIDAS_ID))
+    if not canal:
+        print(f"[VIDAS] Canal {CANAL_VIDAS_ID} nao encontrado; log nao publicado.")
+        return
+
+    if vidas["ilimitado"]:
+        restantes_txt = "♾ Ilimitadas"
+        cor = discord.Color.blurple()
+    elif vidas["restantes"] <= 0:
+        restantes_txt = "💀 **0** — era a última vida"
+        cor = discord.Color.red()
+    else:
+        plural = "vida" if vidas["restantes"] == 1 else "vidas"
+        restantes_txt = f"❤ **{vidas['restantes']}** {plural}"
+        cor = discord.Color.green() if vidas["restantes"] > 1 else discord.Color.orange()
+
+    titulo = "🆕 Primeiro Personagem da Temporada" if primeiro_personagem else "🔁 Personagem Recriado"
+    embed = discord.Embed(title=titulo, color=cor)
+    embed.add_field(name="Jogador", value=f"{membro.mention}\n`{membro.display_name}`", inline=False)
+    embed.add_field(name="Personagem", value=f"```{nome_personagem}```", inline=False)
+    embed.add_field(name="Vidas restantes", value=restantes_txt, inline=True)
+
+    if not vidas["ilimitado"]:
+        embed.add_field(name="Já usadas", value=f"`{vidas['usadas']}` de `{vidas['total']}`", inline=True)
+        if vidas["extras"]:
+            embed.add_field(name="Bônus da staff", value=f"`{vidas['extras']:+d}`", inline=True)
+
+    embed.set_footer(text=f"Discord ID: {membro.id}")
+    with suppress(Exception):
+        await canal.send(embed=embed)
 
 async def alertar_staff_ficha_travada(canal, entrada):
     """Ficha que estourou o limite de tentativas nunca e descartada: vira aviso
@@ -2594,6 +2797,19 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
         aprovado_mod = False
         msg_espera = None
 
+        # Limite de vidas: checado ANTES dos 3 minutos de analise, para o jogador
+        # nao ficar esperando so para ouvir que nao pode criar. O bypass da staff
+        # (/aprovar_ficha) ignora o limite de proposito.
+        if not bypass:
+            pode_criar, vidas_jogador = jogador_pode_criar_personagem(user_id_str, bool(personagem_antigo))
+            if not pode_criar:
+                manter_na_fila = False
+                return await message.channel.send(
+                    f"💀 **VIDAS ESGOTADAS:** {message.author.mention}, você já usou todas as suas "
+                    f"**{vidas_jogador['total']}** vidas desta temporada e não pode criar outro personagem.\n"
+                    f"*(Staff: use `/adicionar_vidas` para liberar uma vida extra, ou `/aprovar_ficha` para ignorar o limite)*"
+                )
+
         if not bypass:
             espera_restante = ESPERA_ANALISE_FICHA_SEGUNDOS if segundos_espera is None else max(0, int(segundos_espera))
 
@@ -2725,6 +2941,20 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
         remover_ficha_em_analise(message.channel.id, message.id)
         print(f"[FICHAS] Registro confirmado: {nome_novo_limpo} (discord {user_id_str}).")
 
+        # Vida so e consumida em RECRIACAO: o primeiro personagem da temporada
+        # e gratuito. E so depois do registro estar confirmado no servidor.
+        houve_personagem_anterior = bool(personagem_antigo)
+        if houve_personagem_anterior:
+            vidas_atuais = consumir_vida(user_id_str)
+        else:
+            vidas_atuais = calcular_vidas(user_id_str)
+
+        with suppress(Exception):
+            await registrar_log_vidas(
+                message.author, nome_novo_limpo,
+                vidas_atuais, primeiro_personagem=not houve_personagem_anterior,
+            )
+
         aviso_nick = ""
         try:
             await message.author.edit(nick=nome_novo_limpo[:32])
@@ -2736,6 +2966,7 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
 
         embed = discord.Embed(title="✅ Registro Concluído com Sucesso!", color=discord.Color.green())
         embed.add_field(name="Login", value=f"```{nome_novo_limpo}```", inline=False)
+        embed.add_field(name="Vidas", value=texto_vidas_restantes(vidas_atuais), inline=False)
         embed.description = f"{aviso_nick}\n\n**Seus dados de acesso foram enviados no seu PV (DM)!**\nEste ticket se auto-destruirá em **5 minutos**."
 
         try:
@@ -3421,6 +3652,143 @@ async def aprovar_ficha(interaction: discord.Interaction):
 
     await interaction.followup.send("❌ Não encontrei nenhuma ficha de jogador nas últimas mensagens nem em análise neste ticket.")
 
+@bot.tree.command(name="configurar_vidas", description="❤ Define quantas vidas (recriações) cada jogador tem na temporada")
+@app_commands.describe(
+    modo="Limitado = usa a quantidade informada. Ilimitado = sem limite de personagens.",
+    quantidade="Quantas vezes o jogador pode RECRIAR o personagem (não conta o primeiro). Só para o modo Limitado.",
+)
+@app_commands.choices(modo=[
+    app_commands.Choice(name="Limitado", value="limitado"),
+    app_commands.Choice(name="Ilimitado (padrão)", value="ilimitado"),
+])
+@app_commands.default_permissions(administrator=True)
+async def configurar_vidas(interaction: discord.Interaction, modo: app_commands.Choice[str] = None, quantidade: int = None):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    config = carregar_config_vidas()
+
+    # Sem argumentos: apenas mostra a configuração atual.
+    if modo is None and quantidade is None:
+        atual = "♾ Ilimitado" if config["ilimitado"] else f"`{config['limite_vidas']}` recriações por jogador"
+        embed = discord.Embed(title="❤ Configuração de Vidas", color=discord.Color.blurple())
+        embed.add_field(name="Modo atual", value=atual, inline=False)
+        embed.add_field(name="Jogadores com vidas usadas", value=f"`{len(config['vidas_usadas'])}`", inline=True)
+        embed.add_field(name="Jogadores com bônus", value=f"`{len(config['vidas_extras'])}`", inline=True)
+        embed.set_footer(text="Use o parâmetro 'modo' para alterar.")
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    valor_modo = modo.value if modo else ("limitado" if quantidade is not None else "ilimitado")
+
+    if valor_modo == "ilimitado":
+        config["ilimitado"] = True
+        salvar_config_vidas(config)
+        return await interaction.response.send_message(
+            "♾ **Limite de vidas desativado.** Os jogadores podem criar quantos personagens quiserem "
+            "(sempre respeitando a morte do anterior).\n"
+            "*O histórico de vidas usadas foi mantido — se você religar o limite, ninguém volta do zero.*",
+            ephemeral=True,
+        )
+
+    if quantidade is None:
+        return await interaction.response.send_message(
+            "❌ No modo **Limitado** você precisa informar a `quantidade` de vidas.", ephemeral=True)
+    if quantidade < 0:
+        return await interaction.response.send_message("❌ A quantidade não pode ser negativa.", ephemeral=True)
+
+    anterior = "ilimitado" if config["ilimitado"] else str(config["limite_vidas"])
+    config["ilimitado"] = False
+    config["limite_vidas"] = quantidade
+    salvar_config_vidas(config)
+
+    embed = discord.Embed(
+        title="❤ Limite de Vidas Atualizado",
+        description=f"De **{anterior}** para **{quantidade}** recriação(ões) por jogador.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="Como fica na prática",
+        value=(
+            f"Cada jogador pode ter **{quantidade + 1}** personagens no total desta temporada "
+            f"(o primeiro + {quantidade} recriações)."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Ninguém foi resetado",
+        value=(
+            "O bot guarda quantas vidas cada um já **usou**, não quantas restam. "
+            f"Quem já tinha gastado 1 vida agora fica com **{max(0, quantidade - 1)}** restantes; "
+            f"quem não gastou nenhuma fica com **{quantidade}**."
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="adicionar_vidas", description="➕ Dá (ou tira) vidas extras de um jogador específico")
+@app_commands.describe(
+    jogador="Jogador do Discord (digite o nome ou use @)",
+    quantidade="Quantas vidas adicionar. Use número negativo para tirar.",
+)
+@app_commands.default_permissions(administrator=True)
+async def adicionar_vidas(interaction: discord.Interaction, jogador: discord.Member, quantidade: int):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    if quantidade == 0:
+        return await interaction.response.send_message("❌ Informe um valor diferente de zero.", ephemeral=True)
+
+    antes = calcular_vidas(jogador.id)
+    depois = adicionar_vidas_extras(jogador.id, quantidade)
+
+    embed = discord.Embed(
+        title="❤ Vidas Ajustadas",
+        description=f"{jogador.mention} recebeu **{quantidade:+d}** vida(s).",
+        color=discord.Color.green() if quantidade > 0 else discord.Color.orange(),
+    )
+
+    if depois["ilimitado"]:
+        embed.add_field(
+            name="⚠ Atenção",
+            value=(
+                "A temporada está no modo **ilimitado**, então esse bônus não muda nada agora — "
+                "mas fica guardado e passa a valer se você ativar o limite com `/configurar_vidas`."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Vidas restantes", value=f"`{antes['restantes']}` ➜ **`{depois['restantes']}`**", inline=True)
+        embed.add_field(name="Já usadas", value=f"`{depois['usadas']}` de `{depois['total']}`", inline=True)
+        embed.add_field(name="Bônus acumulado", value=f"`{depois['extras']:+d}`", inline=True)
+
+    embed.set_footer(text=f"Ajustado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="ver_vidas", description="👁 Consulta quantas vidas um jogador ainda tem")
+@app_commands.describe(jogador="Jogador do Discord (digite o nome ou use @)")
+@app_commands.default_permissions(administrator=True)
+async def ver_vidas(interaction: discord.Interaction, jogador: discord.Member):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    vidas = calcular_vidas(jogador.id)
+    personagem = carregar_personagens().get(str(jogador.id))
+
+    embed = discord.Embed(title="❤ Vidas do Jogador", color=discord.Color.blurple())
+    embed.add_field(name="Jogador", value=f"{jogador.mention}\n`{jogador.id}`", inline=False)
+    embed.add_field(name="Personagem atual", value=f"```{personagem or 'nenhum'}```", inline=False)
+
+    if vidas["ilimitado"]:
+        embed.add_field(name="Situação", value="♾ Temporada com vidas **ilimitadas**", inline=False)
+        embed.add_field(name="Recriações já feitas", value=f"`{vidas['usadas']}`", inline=True)
+    else:
+        embed.add_field(name="Vidas restantes", value=f"**`{vidas['restantes']}`** de `{vidas['total']}`", inline=True)
+        embed.add_field(name="Já usadas", value=f"`{vidas['usadas']}`", inline=True)
+        if vidas["extras"]:
+            embed.add_field(name="Bônus da staff", value=f"`{vidas['extras']:+d}`", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="fila_registros", description="📋 Mostra as fichas na fila esperando o servidor abrir")
 @app_commands.default_permissions(administrator=True)
 async def fila_registros(interaction: discord.Interaction):
@@ -3472,17 +3840,13 @@ async def fila_registros(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="enviar_formulario", description="📝 Envia o botão do formulário de ficha neste canal")
+@app_commands.describe(jogador="Dono do ticket (opcional). Usado para mostrar as vidas certas na mensagem.")
 @app_commands.default_permissions(administrator=True)
-async def enviar_formulario(interaction: discord.Interaction):
+async def enviar_formulario(interaction: discord.Interaction, jogador: discord.Member = None):
     if await bloquear_se_nao_for_staff(interaction):
         return
     await interaction.response.send_message("✅ Formulário enviado neste canal.", ephemeral=True)
-    await interaction.channel.send(
-        "📝 **Clique no botão abaixo para preencher sua ficha.**\n"
-        "O formulário abre uma janela com os campos separados — assim não tem risco de errar o formato.\n"
-        "*(Se preferir, você ainda pode digitar a ficha normalmente aqui no chat.)*",
-        view=FichaFormView(),
-    )
+    await enviar_painel_ficha(interaction.channel, jogador or interaction.user)
 
 @bot.tree.command(name="historico_registro", description="📚 Consulta o último registro de personagem de um player")
 @app_commands.describe(jogador="Jogador do Discord que você quer consultar")

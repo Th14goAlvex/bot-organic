@@ -19,6 +19,7 @@ historico_personagens.json
 status_jogadores.json
 vips.json
 sorteios.json
+config_vidas.json
 
 # CONFIGURACAO (versionada de proposito): sem estes arquivos os botoes de
 # ticket param de funcionar e o bot cria uma mensagem de status duplicada.
