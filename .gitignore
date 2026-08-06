@@ -1,0 +1,63 @@
+# =====================================================================
+# SEGREDOS - NUNCA versionar
+# Token do Discord, senha do RCON e chaves de API ficam so no .env local.
+# =====================================================================
+.env
+.env.*
+!.env.example
+
+# =====================================================================
+# BANCOS DE DADOS - contem dados pessoais de jogadores reais
+# (senhas em texto plano, IDs do Discord, nomes de personagens).
+# Cada instalacao gera os seus; versionar daria conflito entre maquinas.
+# =====================================================================
+registros_personagens.json
+fichas_pendentes.json
+fichas_em_analise.json
+personagens.json
+historico_personagens.json
+status_jogadores.json
+vips.json
+sorteios.json
+
+# CONFIGURACAO (versionada de proposito): sem estes arquivos os botoes de
+# ticket param de funcionar e o bot cria uma mensagem de status duplicada.
+#   paineis.json        -> qual botao abre qual categoria de ticket
+#   msg_status_id.json  -> id da mensagem de status do servidor
+# Obs: o bot reescreve os dois em runtime (/criar_painel, radar de status),
+# entao eles podem aparecer como modificados depois que o bot rodar.
+templates_mensagens.json
+
+# Artefatos da gravacao atomica dos bancos JSON
+*.json.tmp
+*.json.bak
+
+# =====================================================================
+# Python
+# =====================================================================
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# =====================================================================
+# Runtime do bot
+# =====================================================================
+reuniao_zomboid.wav
+*.wav
+*.log
+
+# Pacotes de migracao
+/bot_organic_migracao_*.zip
+/bot_organic_migracao_*.sha256
+/bot_organic_requirements_*.txt
+
+# Sistema operacional / editores
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
