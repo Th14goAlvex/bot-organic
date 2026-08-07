@@ -1123,27 +1123,39 @@ async def expulsar_jogador_sem_call_ingame(nome_personagem):
 
     return False, ultimo_erro or "não consegui expulsar o jogador"
 
+EXTENSOES_MORTE = (".txt", ".csv", ".log")
+NOMES_ARQUIVO_MORTE = ("death", "morte", "died")
+
 def caminhos_mortes_friendhost():
-    candidatos = [
-        CAMINHO_MORTES,
-        os.path.join(CSV_BASE_PATH, "deaths.csv"),
-        os.path.join(CSV_BASE_PATH, "Servidor", "deaths.csv"),
-    ]
+    """Localiza o arquivo de mortes do mod. O mod ja usou .csv e hoje usa .txt,
+    entao a busca aceita as duas extensoes em vez de fixar uma."""
+    candidatos = [CAMINHO_MORTES]
+    for base in (CSV_BASE_PATH, os.path.join(CSV_BASE_PATH, "Servidor")):
+        for extensao in EXTENSOES_MORTE:
+            candidatos.append(os.path.join(base, f"deaths{extensao}"))
+            candidatos.append(os.path.join(base, f"death{extensao}"))
 
     with suppress(Exception):
         for raiz, _, arquivos in os.walk(CSV_BASE_PATH):
             for arquivo in arquivos:
-                if "death" in arquivo.lower() and arquivo.lower().endswith(".csv"):
+                nome = arquivo.lower()
+                if nome.endswith(EXTENSOES_MORTE) and any(p in nome for p in NOMES_ARQUIVO_MORTE):
                     candidatos.append(os.path.join(raiz, arquivo))
 
     vistos = set()
     existentes = []
     for caminho in candidatos:
+        if not caminho:
+            continue
         caminho = os.path.abspath(caminho)
         if caminho in vistos or not os.path.exists(caminho):
             continue
         vistos.add(caminho)
         existentes.append(caminho)
+
+    # Mais recente primeiro: se o mod trocou de arquivo, o novo vem na frente.
+    with suppress(Exception):
+        existentes.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return existentes
 
 def caminhos_logs_morte_friendhost(max_arquivos=40):
@@ -1204,28 +1216,122 @@ def linha_morte_tem_personagem(texto_linha, nome_personagem):
 
     return False
 
-def personagem_morreu_no_csv(nome_personagem):
+MARCADORES_MORTE = ("died", "death", "morreu", "morte", "sendplayerdatadead", "is dead")
+
+def linha_indica_morte(linha):
+    baixa = remover_acentos(linha or "").lower()
+    return any(marcador in baixa for marcador in MARCADORES_MORTE)
+
+def campos_estruturados_morte(linha):
+    """Se a linha vier em colunas (o mod usa ';'), devolve os campos.
+    Vale tanto para o .csv antigo quanto para um .txt com o mesmo layout."""
+    for separador in (";", "|", "\t"):
+        if (linha or "").count(separador) >= 3:
+            return [campo.strip().strip('"').strip() for campo in linha.split(separador)]
+    return []
+
+def nomes_na_linha_morte(linha):
+    """Nomes de personagem citados numa linha de morte.
+
+    Cobre os dois formatos que o mod ja usou:
+      - estruturado por ';' -> colunas 4 (login) e 5 (nome do personagem)
+      - log em texto        -> nome entre aspas ou antes de 'died'/'morreu'
+    """
+    linha = linha or ""
+    nomes = []
+    campos = campos_estruturados_morte(linha)
+
+    if len(campos) >= 6:
+        for indice in (4, 5):
+            if campos[indice]:
+                nomes.append(campos[indice])
+        if nomes:
+            return _limpar_nomes_morte(nomes)
+
+    if campos:
+        nomes.extend(campos)
+
+    nomes.extend(re.findall(r'"([^"]{2,40})"', linha))
+    for padrao in (
+        r"(?i)\b(?:user|player|jogador)\s+([A-Za-z0-9_][A-Za-z0-9_ ]{1,39}?)\s+(?:died|is dead|morreu)",
+        r"(?i)\b([A-Za-z0-9_][A-Za-z0-9_ ]{1,39}?)\s+(?:died|morreu)\b",
+    ):
+        nomes.extend(re.findall(padrao, linha))
+
+    return _limpar_nomes_morte(nomes)
+
+def _limpar_nomes_morte(nomes):
+    vistos = set()
+    limpos = []
+    for nome in nomes:
+        nome = (nome or "").strip().strip('"').strip()
+        chave = normalizar_chave_personagem(nome)
+        # Descarta numero puro (id, timestamp, coordenada) e campo vazio.
+        if not chave or not re.search(r"[A-Za-zÀ-ÿ]", nome):
+            continue
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        limpos.append(nome)
+    return limpos
+
+def extrair_morte_da_linha(linha):
+    """Porta de entrada unica da deteccao de morte.
+
+    Devolve:
+      None  -> a linha NAO e um registro de morte (ignorar)
+      []    -> e morte, mas nao deu para extrair o nome
+      [...] -> nomes envolvidos na morte
+
+    A regra critica esta aqui: linha em texto livre so conta como morte se
+    disser explicitamente (died/morreu/...). Sem isso, um simples
+    'user "Fulano" connected' liberaria o jogador para recriar estando vivo.
+    """
+    linha = linha or ""
+    if not linha.strip():
+        return None
+
+    estruturada = len(campos_estruturados_morte(linha)) >= 6
+    if not estruturada and not linha_indica_morte(linha):
+        return None
+
+    return nomes_na_linha_morte(linha)
+
+def nome_bate_com_morte(nome_personagem, nomes_linha, linha):
     nome_norm = normalizar_chave_personagem(nome_personagem)
     nome_compacto = compactar_chave_personagem(nome_personagem)
     if not nome_norm:
         return False
 
+    for candidato in nomes_linha:
+        candidato_norm = normalizar_chave_personagem(candidato)
+        if candidato_norm == nome_norm:
+            return True
+        if nome_compacto and compactar_chave_personagem(candidato) == nome_compacto:
+            return True
+
+    # Formato desconhecido: cai na comparacao direta contra a linha inteira.
+    if not nomes_linha:
+        return linha_morte_tem_personagem(linha, nome_personagem)
+
+    return False
+
+def personagem_morreu_no_csv(nome_personagem):
+    """Procura a morte no arquivo do mod, seja ele .csv ou .txt."""
+    if not normalizar_chave_personagem(nome_personagem):
+        return False
+
     for caminho in caminhos_mortes_friendhost():
         try:
-            with open(caminho, "r", encoding="utf-8", errors="replace", newline="") as f:
-                leitor = csv.reader(f, delimiter=";")
-                for row in leitor:
-                    campos_principais = []
-                    for idx in (4, 5):
-                        if idx < len(row):
-                            campos_principais.append(row[idx])
-
-                    for campo in campos_principais or row:
-                        campo_norm = normalizar_chave_personagem(campo.replace('"', ''))
-                        if campo_norm == nome_norm or compactar_chave_personagem(campo_norm) == nome_compacto:
-                            return True
+            conteudo = ler_final_arquivo(caminho)
+            for linha in conteudo.splitlines():
+                nomes = extrair_morte_da_linha(linha)
+                if nomes is None:
+                    continue
+                if nome_bate_com_morte(nome_personagem, nomes, linha):
+                    return True
         except Exception as erro:
-            print(f"[MORTES] Falha ao ler CSV de mortes {caminho}: {erro}")
+            print(f"[MORTES] Falha ao ler arquivo de mortes {caminho}: {erro}")
 
     return False
 
@@ -2611,22 +2717,32 @@ async def monitorar_mortes():
                     await asyncio.sleep(1)
                     continue
 
-                dados = linha.split(';')
-                if len(dados) >= 6:
-                    login_morto_raw = dados[4].replace('"', '').strip()
-                    nome_morto_raw = dados[5].replace('"', '').strip() or login_morto_raw
+                nomes_mortos = extrair_morte_da_linha(linha)
+                if nomes_mortos is None:
+                    continue
+                if not nomes_mortos:
+                    print(f"[VIGIA] Linha de morte sem nome reconhecido: {linha.strip()[:200]}")
+                    continue
 
-                    status_db = carregar_status()
-                    for nome in (login_morto_raw, nome_morto_raw):
-                        if nome:
-                            status_db[normalizar_chave_personagem(nome)] = "morto"
-                    salvar_status(status_db)
+                # Marca todas as variacoes (login e nome do personagem) para o
+                # anti-fraude achar depois, venha a ficha com qual dos dois vier.
+                status_db = carregar_status()
+                for nome in nomes_mortos:
+                    status_db[normalizar_chave_personagem(nome)] = "morto"
+                salvar_status(status_db)
 
-                    canal = bot.get_channel(int(CANAL_MORTES_ID))
-                    if canal:
-                        embed = discord.Embed(title=" 💀 Jogador Morreu!", description=f"**{nome_morto_raw}** virou comida de zumbi.", color=0xef4444)
-                        embed.add_field(name="Horário", value=f"{dados[1]} - {dados[2]}")
-                        await canal.send(embed=embed)
+                nome_exibido = nomes_mortos[-1]
+                print(f"[VIGIA] Morte detectada: {', '.join(nomes_mortos)}")
+
+                canal = bot.get_channel(int(CANAL_MORTES_ID))
+                if canal:
+                    embed = discord.Embed(title=" 💀 Jogador Morreu!", description=f"**{nome_exibido}** virou comida de zumbi.", color=0xef4444)
+                    campos = campos_estruturados_morte(linha)
+                    if len(campos) >= 3 and campos[1] and campos[2]:
+                        embed.add_field(name="Horário", value=f"{campos[1]} - {campos[2]}")
+                    else:
+                        embed.add_field(name="Horário", value=datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+                    await canal.send(embed=embed)
             except asyncio.CancelledError:
                 raise
             except Exception as erro:
@@ -3651,6 +3767,81 @@ async def aprovar_ficha(interaction: discord.Interaction):
             return
 
     await interaction.followup.send("❌ Não encontrei nenhuma ficha de jogador nas últimas mensagens nem em análise neste ticket.")
+
+@bot.tree.command(name="diagnostico_mortes", description="🔎 Mostra o arquivo de mortes que o bot está lendo e como ele interpreta as linhas")
+@app_commands.describe(linhas="Quantas linhas finais mostrar (padrão 5)")
+@app_commands.default_permissions(administrator=True)
+async def diagnostico_mortes(interaction: discord.Interaction, linhas: int = 5):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    linhas = max(1, min(15, linhas))
+
+    caminhos = await asyncio.to_thread(caminhos_mortes_friendhost)
+
+    embed = discord.Embed(title="🔎 Diagnóstico de Detecção de Mortes", color=discord.Color.blurple())
+    embed.add_field(name="Caminho configurado", value=f"```{CAMINHO_MORTES}```", inline=False)
+
+    if not caminhos:
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="❌ Nenhum arquivo encontrado",
+            value=(
+                f"O bot procurou em:\n```{CSV_BASE_PATH}```\n"
+                "Sem esse arquivo o **anti-fraude não detecta morte nenhuma**.\n"
+                "Corrija com `CAMINHO_MOD_MORTES=` ou `CSV_BASE_PATH=` no `.env`."
+            ),
+            inline=False,
+        )
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    embed.add_field(
+        name=f"✅ {len(caminhos)} arquivo(s) encontrado(s)",
+        value="```" + "\n".join(caminhos[:5]) + "```",
+        inline=False,
+    )
+
+    principal = caminhos[0]
+    try:
+        conteudo = await asyncio.to_thread(ler_final_arquivo, principal)
+        ultimas = [linha for linha in conteudo.splitlines() if linha.strip()][-linhas:]
+    except Exception as erro:
+        embed.color = discord.Color.red()
+        embed.add_field(name="❌ Erro ao ler", value=f"```{erro}```", inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    if not ultimas:
+        embed.add_field(name="⚠ Arquivo vazio", value="Ainda não morreu ninguém, ou o mod não está gravando aqui.", inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    bruto = "\n".join(linha[:180] for linha in ultimas)
+    embed.add_field(name="Últimas linhas (bruto)", value=f"```{bruto[:1000]}```", inline=False)
+
+    leitura = []
+    for linha in ultimas:
+        nomes = nomes_na_linha_morte(linha)
+        if nomes:
+            leitura.append(f"✅ {', '.join(nomes)}")
+        else:
+            leitura.append("❌ nenhum nome reconhecido" + ("" if linha_indica_morte(linha) else " (sem marcador de morte)"))
+
+    reconhecidas = sum(1 for item in leitura if item.startswith("✅"))
+    embed.add_field(name="Como o bot interpretou", value="```" + "\n".join(leitura)[:1000] + "```", inline=False)
+
+    if reconhecidas == 0:
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="🚨 Formato não reconhecido",
+            value="O bot achou o arquivo mas **não consegue extrair os nomes**. O anti-fraude não vai funcionar. Mande essas linhas para ajustar o parser.",
+            inline=False,
+        )
+    elif reconhecidas < len(ultimas):
+        embed.color = discord.Color.orange()
+    else:
+        embed.color = discord.Color.green()
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="configurar_vidas", description="❤ Define quantas vidas (recriações) cada jogador tem na temporada")
 @app_commands.describe(
