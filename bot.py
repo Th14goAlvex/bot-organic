@@ -115,6 +115,10 @@ ARQUIVO_FICHAS_EM_ANALISE = os.path.join(BASE_DIR, "fichas_em_analise.json")
 ARQUIVO_CONFIG_VIDAS = os.path.join(BASE_DIR, "config_vidas.json")
 ARQUIVO_VERSAO_BOT = os.path.join(BASE_DIR, "versao_bot.json")
 ARQUIVO_CONFIG_ABERTURA = os.path.join(BASE_DIR, "config_abertura.json")
+ARQUIVO_CONFIG_TICKETS = os.path.join(BASE_DIR, "config_tickets.json")
+ARQUIVO_TICKETS_FECHAMENTO = os.path.join(BASE_DIR, "tickets_fechamento.json")
+
+MINUTOS_FECHAR_TICKET_PADRAO = 5
 
 # Fuso usado para interpretar/mostrar horarios digitados pela staff.
 # -3 = horario de Brasilia. A host pode rodar em UTC, entao nao da para confiar
@@ -551,6 +555,46 @@ def texto_vidas_restantes(vidas):
         return "💀 **Você não tem mais vidas.** Este foi seu último personagem da temporada."
     plural = "vida" if vidas["restantes"] == 1 else "vidas"
     return f"❤ Você ainda tem **{vidas['restantes']} {plural}** (personagens que ainda pode criar depois deste)."
+
+# --- FECHAMENTO AUTOMATICO DOS TICKETS ---
+# O prazo fica gravado em disco em vez de um sleep na memoria: assim o ticket
+# nao vira orfao se o bot reiniciar no meio da espera.
+
+def carregar_config_tickets():
+    config = carregar_json_seguro(ARQUIVO_CONFIG_TICKETS, {})
+    return config if isinstance(config, dict) else {}
+
+def salvar_config_tickets(dados):
+    salvar_json_seguro(ARQUIVO_CONFIG_TICKETS, dados, ensure_ascii=False)
+
+def minutos_fechar_ticket():
+    """Minutos ate o ticket de registro ser apagado, ou None se desativado."""
+    config = carregar_config_tickets()
+    if config.get("desativado"):
+        return None
+    try:
+        minutos = int(config.get("minutos", MINUTOS_FECHAR_TICKET_PADRAO))
+    except Exception:
+        minutos = MINUTOS_FECHAR_TICKET_PADRAO
+    return minutos if minutos > 0 else None
+
+def carregar_tickets_para_fechar():
+    dados = carregar_json_seguro(ARQUIVO_TICKETS_FECHAMENTO, [])
+    return dados if isinstance(dados, list) else []
+
+def salvar_tickets_para_fechar(dados):
+    salvar_json_seguro(ARQUIVO_TICKETS_FECHAMENTO, dados)
+
+def agendar_fechamento_ticket(canal_id, minutos):
+    lista = [t for t in carregar_tickets_para_fechar() if t.get("canal_id") != canal_id]
+    lista.append({"canal_id": canal_id, "fechar_em": time.time() + minutos * 60})
+    salvar_tickets_para_fechar(lista)
+
+def cancelar_fechamento_ticket(canal_id):
+    lista = carregar_tickets_para_fechar()
+    restantes = [t for t in lista if t.get("canal_id") != canal_id]
+    if len(restantes) != len(lista):
+        salvar_tickets_para_fechar(restantes)
 
 # --- AGENDAMENTO DA ABERTURA DOS REGISTROS ---
 # Permite abrir os tickets antes do servidor existir: as fichas entram na fila
@@ -1859,6 +1903,53 @@ def montar_texto_ficha(nome, senha, profissao, historia):
 def canal_tem_ficha_em_analise(canal_id):
     return any(a.get("canal_id") == canal_id for a in carregar_fichas_em_analise())
 
+def ficha_ativa_no_canal(canal_id, ignorar_msg_id=None):
+    """Ha alguma ficha viva neste ticket? Olha a analise em andamento E a fila
+    duravel. So checar a analise nao bastava: com abertura agendada ou servidor
+    offline a ficha fica na fila, e o jogador conseguia mandar outra por cima."""
+    if canal_tem_ficha_em_analise(canal_id):
+        return True
+    return any(
+        p.get("canal_id") == canal_id and p.get("msg_id") != ignorar_msg_id
+        for p in carregar_fila_registro()
+    )
+
+def manter_apenas_ficha_mais_recente(canal_id=None):
+    """Um ticket = uma ficha. Se houver mais de uma na fila do mesmo canal,
+    vale a ULTIMA enviada e as anteriores sao descartadas.
+
+    O id de mensagem do Discord e um snowflake crescente, entao o maior id e
+    sempre o mais recente. Serve para limpar tickets em que o jogador mandou
+    ficha duas vezes antes desta trava existir."""
+    fila = carregar_fila_registro()
+    if not fila:
+        return []
+
+    mais_recente = {}
+    for entrada in fila:
+        canal = entrada.get("canal_id")
+        if canal_id is not None and canal != canal_id:
+            continue
+        atual = mais_recente.get(canal)
+        if atual is None or int(entrada.get("msg_id") or 0) > int(atual.get("msg_id") or 0):
+            mais_recente[canal] = entrada
+
+    descartadas = []
+    nova_fila = []
+    for entrada in fila:
+        canal = entrada.get("canal_id")
+        if canal in mais_recente and entrada is not mais_recente[canal]:
+            descartadas.append(entrada)
+        else:
+            nova_fila.append(entrada)
+
+    if descartadas:
+        salvar_fila_registro(nova_fila)
+        for entrada in descartadas:
+            print(f"[FICHAS] Ficha duplicada descartada no canal {entrada.get('canal_id')} "
+                  f"(msg {entrada.get('msg_id')}); vale a mais recente.")
+    return descartadas
+
 def senha_ficha_valida(senha):
     """O login do Project Zomboid so aceita ASCII. Atencao: str.isalnum() sozinho
     aprova 'senhá123', porque acento conta como alfanumerico em Unicode; por isso
@@ -1922,8 +2013,13 @@ class FichaModal(discord.ui.Modal, title="Ficha de Personagem"):
         if erro:
             return await interaction.followup.send(f"❌ **Ficha não enviada:** {erro}\n\nClique no botão novamente e corrija.", ephemeral=True)
 
-        if canal_tem_ficha_em_analise(interaction.channel.id):
-            return await interaction.followup.send("⏳ **Você já tem uma ficha em análise neste ticket.** Aguarde o resultado antes de enviar outra.", ephemeral=True)
+        if ficha_ativa_no_canal(interaction.channel.id):
+            return await interaction.followup.send(
+                "🚫 **Você já enviou uma ficha neste ticket.**\n\n"
+                "Só é permitida **uma ficha por ticket**. Se errou algum dado, use o botão "
+                "**🗑 Fechar Ticket** aqui embaixo e abra um novo — isso **não gasta vida**.",
+                ephemeral=True,
+            )
 
         user_id_str = str(interaction.user.id)
         tem_personagem = bool(carregar_personagens().get(user_id_str))
@@ -2005,7 +2101,7 @@ async def enviar_painel_ficha(canal, membro):
             color=discord.Color.red(),
         )
         embed.set_footer(text="Staff: use /adicionar_vidas para liberar uma vida extra.")
-        return await canal.send(embed=embed)
+        return await canal.send(embed=embed, view=FecharTicketView())
 
     aviso_abertura = ""
     if not registros_estao_liberados():
@@ -2037,6 +2133,76 @@ class FichaFormView(discord.ui.View):
     )
     async def preencher_ficha(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(FichaModal())
+
+    @discord.ui.button(
+        label="Fechar Ticket",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑",
+        custom_id="btn_fechar_ticket_zomboid",
+    )
+    async def fechar_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await fechar_ticket_por_botao(interaction)
+
+class FecharTicketView(discord.ui.View):
+    """So o botao de fechar. Usada quando o jogador nao pode mais criar ficha."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Fechar Ticket",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑",
+        custom_id="btn_fechar_ticket_solo",
+    )
+    async def fechar_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await fechar_ticket_por_botao(interaction)
+
+async def fechar_ticket_por_botao(interaction: discord.Interaction):
+    """Fecha o ticket a pedido do jogador.
+
+    Descarta a ficha que estava guardada, para ela nao ser registrada depois.
+    Como a vida so e consumida quando o registro e CONFIRMADO no servidor,
+    fechar aqui nunca gasta vida."""
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except discord.HTTPException:
+        return
+
+    canal = interaction.channel
+    if not categoria_processa_ficha_pos_morte(getattr(canal, "category", None)):
+        return await interaction.followup.send("❌ Este botão só funciona em ticket de personagem.", ephemeral=True)
+
+    with suppress(Exception):
+        await cancelar_processamento_ficha(canal.id, None)
+
+    descartadas = 0
+    for entrada in [p for p in carregar_fila_registro() if p.get("canal_id") == canal.id]:
+        with suppress(Exception):
+            await cancelar_processamento_ficha(entrada.get("canal_id"), entrada.get("msg_id"))
+        if remover_da_fila_registro(entrada.get("canal_id"), entrada.get("msg_id")):
+            descartadas += 1
+
+    for analise in [a for a in carregar_fichas_em_analise() if a.get("canal_id") == canal.id]:
+        with suppress(Exception):
+            await cancelar_processamento_ficha(analise.get("canal_id"), analise.get("msg_id"))
+        remover_ficha_em_analise(analise.get("canal_id"), analise.get("msg_id"))
+
+    cancelar_fechamento_ticket(canal.id)
+
+    print(f"[TICKET] {interaction.user} fechou o ticket {canal.id}; {descartadas} ficha(s) descartada(s).")
+    await interaction.followup.send("✅ Fechando o ticket... Pode abrir um novo quando quiser.", ephemeral=True)
+
+    with suppress(Exception):
+        await canal.send(
+            f"🗑 **Ticket fechado por {interaction.user.mention}.**\n"
+            + ("A ficha enviada foi **descartada** e **não gastou vida**.\n" if descartadas else "")
+            + "Este canal será apagado em instantes."
+        )
+
+    await asyncio.sleep(5)
+    with suppress(Exception):
+        await canal.delete(reason=f"Ticket fechado por {interaction.user}")
 
 @dataclass
 class RconResult:
@@ -2339,6 +2505,7 @@ class ZomboidBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(TicketButton())
         self.add_view(FichaFormView())
+        self.add_view(FecharTicketView())
         await self.tree.sync()
 
     async def close(self):
@@ -2352,7 +2519,7 @@ class ZomboidBot(commands.Bot):
             *tarefas_remocao_vip.values(),
             *tarefas_fichas,
         ] if tarefa is not None]
-        for loop in (radar_servidor, loop_sorteios, loop_retentar_registros, supervisor_monitores):
+        for loop in (radar_servidor, loop_sorteios, loop_retentar_registros, supervisor_monitores, loop_fechar_tickets):
             if loop.is_running():
                 loop.cancel()
         for tarefa in tarefas:
@@ -2661,6 +2828,39 @@ async def cancelar_processamento_ficha(canal_id, msg_id):
     tarefas_fichas_por_chave.pop(chave, None)
     fichas_em_processamento.discard(chave)
 
+@tasks.loop(seconds=30)
+async def loop_fechar_tickets():
+    """Fecha os tickets cujo prazo venceu. O prazo esta em disco, entao um
+    reinicio no meio da espera nao deixa o canal orfao."""
+    pendentes = carregar_tickets_para_fechar()
+    if not pendentes:
+        return
+
+    agora = time.time()
+    restantes = []
+
+    for item in pendentes:
+        try:
+            if agora < float(item.get("fechar_em", 0)):
+                restantes.append(item)
+                continue
+
+            canal = bot.get_channel(int(item.get("canal_id")))
+            if canal:
+                await canal.delete(reason="Registro concluido: fechamento automatico do ticket")
+                print(f"[TICKET] Canal {item.get('canal_id')} fechado automaticamente.")
+        except discord.NotFound:
+            pass
+        except Exception as erro:
+            print(f"[TICKET] Falha ao fechar canal {item.get('canal_id')}: {erro}")
+
+    if len(restantes) != len(pendentes):
+        salvar_tickets_para_fechar(restantes)
+
+@loop_fechar_tickets.before_loop
+async def antes_loop_fechar_tickets():
+    await bot.wait_until_ready()
+
 @tasks.loop(minutes=2)
 async def loop_retentar_registros():
     """Rede de seguranca independente: a cada 2 minutos reexamina a fila.
@@ -2820,6 +3020,10 @@ async def processar_fichas_pendentes(espera_estabilizacao=True):
             servidor_online = False
             print(f"[FICHAS] RCON nao respondeu players; fila mantida intacta: {resultado_rcon.error}")
             return
+
+        # Rede de seguranca: tickets com mais de uma ficha (enviadas antes da
+        # trava existir) ficam so com a mais recente.
+        manter_apenas_ficha_mais_recente()
 
         fila = carregar_fila_registro()
         if not fila:
@@ -3251,6 +3455,16 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
             manter_na_fila = False
             return await message.channel.send("❌ **REGISTRO CANCELADO:** A senha não pode ter símbolos, espaços ou acentos. Use apenas letras e números. Mande a ficha novamente.")
 
+        # Uma ficha por ticket. Ignora a propria entrada para nao se auto-barrar
+        # quando a fila e reprocessada.
+        if not bypass and ficha_ativa_no_canal(message.channel.id, ignorar_msg_id=message.id):
+            manter_na_fila = False
+            return await message.channel.send(
+                "🚫 **Já existe uma ficha em andamento neste ticket.**\n"
+                "Só vale **uma ficha por ticket** — a que você enviou antes continua valendo.\n"
+                "Se errou algum dado, use o botão **🗑 Fechar Ticket** e abra um novo. Isso **não gasta vida**."
+            )
+
         # Portao do agendamento: a ficha entra na fila duravel e espera a hora
         # marcada. Nada e perdido nem aprovado antes do tempo.
         if not bypass and not registros_estao_liberados():
@@ -3448,7 +3662,13 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
         embed = discord.Embed(title="✅ Registro Concluído com Sucesso!", color=discord.Color.green())
         embed.add_field(name="Login", value=f"```{nome_novo_limpo}```", inline=False)
         embed.add_field(name="Vidas", value=texto_vidas_restantes(vidas_atuais), inline=False)
-        embed.description = f"{aviso_nick}\n\n**Seus dados de acesso foram enviados no seu PV (DM)!**\nEste ticket se auto-destruirá em **5 minutos**."
+        minutos_ticket = minutos_fechar_ticket()
+        aviso_fechamento = (
+            f"Este ticket se fecha sozinho em **{minutos_ticket} minuto(s)**."
+            if minutos_ticket else
+            "Quando terminar de anotar seus dados, use o botão **🗑 Fechar Ticket**."
+        )
+        embed.description = f"{aviso_nick}\n\n**Seus dados de acesso foram enviados no seu PV (DM)!**\n{aviso_fechamento}"
 
         try:
             dm_embed = discord.Embed(title="🔑 Seus dados de acesso", color=discord.Color.green())
@@ -3458,12 +3678,12 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
             await message.author.send(embed=dm_embed)
         except discord.Forbidden:
             embed.add_field(name="Senha", value=f"```{senha_raw}```", inline=False)
-            embed.description = f"{aviso_nick}\n\n**Copie e salve seus dados!** (DM bloqueada, enviando aqui)\nEste ticket se auto-destruirá em **5 minutos**."
+            embed.description = f"{aviso_nick}\n\n**Copie e salve seus dados!** (DM bloqueada, enviando aqui)\n{aviso_fechamento}"
 
         await message.channel.send(content=message.author.mention, embed=embed)
-        await asyncio.sleep(300)
-        try: await message.channel.delete()
-        except: pass
+
+        if minutos_ticket:
+            agendar_fechamento_ticket(message.channel.id, minutos_ticket)
 
     except Exception as e:
         # Erro inesperado conta como transitorio: a ficha fica na fila e sera
@@ -4163,6 +4383,82 @@ async def aprovar_ficha(interaction: discord.Interaction):
         "*Peça para o jogador enviar a ficha primeiro.*"
     )
 
+@bot.tree.command(name="tempo_fechar_ticket", description="🗑 Define em quantos minutos o ticket some depois do registro")
+@app_commands.describe(
+    minutos="Minutos até o ticket ser apagado após o registro concluído.",
+    desativar="Se marcado, o ticket NUNCA é apagado sozinho.",
+)
+@app_commands.default_permissions(administrator=True)
+async def tempo_fechar_ticket(interaction: discord.Interaction, minutos: int = None, desativar: bool = False):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    atual = minutos_fechar_ticket()
+    na_fila = len(carregar_tickets_para_fechar())
+
+    # Sem argumentos: mostra a configuração atual.
+    if minutos is None and not desativar:
+        embed = discord.Embed(title="🗑 Fechamento Automático de Tickets", color=discord.Color.blurple())
+        if atual:
+            embed.description = f"Os tickets de personagem somem **{atual} minuto(s)** depois do registro concluído."
+        else:
+            embed.color = discord.Color.orange()
+            embed.description = "🔕 **Desativado.** Os tickets ficam abertos até alguém fechar."
+        embed.add_field(name="Aguardando fechamento agora", value=f"**{na_fila}** ticket(s)", inline=True)
+        embed.set_footer(text="Use minutos: para alterar, ou desativar:True para nunca apagar.")
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    if desativar:
+        salvar_config_tickets({
+            "desativado": True,
+            "alterado_em": datetime.now().isoformat(),
+            "alterado_por": str(interaction.user),
+        })
+        salvar_tickets_para_fechar([])
+        return await interaction.response.send_message(
+            "🔕 **Fechamento automático desativado.**\n"
+            "Os tickets de personagem vão ficar abertos até alguém usar o botão **🗑 Fechar Ticket** ou `/fechar_ticket`.\n"
+            f"*Os {na_fila} ticket(s) que estavam na fila de fechamento foram poupados.*",
+            ephemeral=True,
+        )
+
+    if minutos < 1:
+        return await interaction.response.send_message(
+            "❌ Use no mínimo **1** minuto. Para nunca apagar, use `desativar:True`.", ephemeral=True)
+    if minutos > 10080:
+        return await interaction.response.send_message("❌ Máximo de **10080** minutos (7 dias).", ephemeral=True)
+
+    salvar_config_tickets({
+        "minutos": minutos,
+        "desativado": False,
+        "alterado_em": datetime.now().isoformat(),
+        "alterado_por": str(interaction.user),
+    })
+
+    anterior = f"**{atual}** minuto(s)" if atual else "**desativado**"
+    embed = discord.Embed(
+        title="🗑 Tempo de Fechamento Atualizado",
+        description=f"De {anterior} para **{minutos}** minuto(s).",
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="Como funciona",
+        value=(
+            "A contagem começa quando o registro é **concluído com sucesso**. "
+            "Ticket recusado ou esperando a abertura não é apagado.\n"
+            "O prazo fica gravado em disco, então vale mesmo se o bot reiniciar no meio."
+        ),
+        inline=False,
+    )
+    if na_fila:
+        embed.add_field(
+            name="Atenção",
+            value=f"**{na_fila}** ticket(s) já estavam agendados com o tempo antigo e mantêm o prazo anterior.",
+            inline=False,
+        )
+    embed.set_footer(text=f"Alterado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="agendar_abertura", description="🗓 Marca a data/hora em que a aprovação de personagens começa")
 @app_commands.describe(
     hora="Hora de início, ex: 20:00 (horário de Brasília)",
@@ -4786,6 +5082,8 @@ async def on_ready():
         loop_sorteios.start()
     if not loop_retentar_registros.is_running():
         loop_retentar_registros.start()
+    if not loop_fechar_tickets.is_running():
+        loop_fechar_tickets.start()
     if not supervisor_monitores.is_running():
         supervisor_monitores.start()
     if tarefa_monitor_mortes is None or tarefa_monitor_mortes.done():
@@ -4798,6 +5096,10 @@ async def on_ready():
         tarefa_retomar_analises = bot.loop.create_task(retomar_fichas_em_analise())
     if tarefa_varredura_fichas is None or tarefa_varredura_fichas.done():
         tarefa_varredura_fichas = bot.loop.create_task(varrer_tickets_abertos_fichas())
+    descartadas = manter_apenas_ficha_mais_recente()
+    if descartadas:
+        print(f"[FICHAS] {len(descartadas)} ficha(s) duplicada(s) removida(s) na inicializacao.")
+
     fila_inicial = carregar_fila_registro()
     if fila_inicial:
         print(f"[FICHAS] {len(fila_inicial)} ficha(s) na fila duravel aguardando registro no servidor.")

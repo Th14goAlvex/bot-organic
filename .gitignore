@@ -67,3 +67,5 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+config_tickets.json
+tickets_fechamento.json
