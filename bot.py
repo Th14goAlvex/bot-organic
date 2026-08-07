@@ -16,6 +16,7 @@ import csv
 import random
 import sqlite3
 from array import array
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -61,9 +62,16 @@ LOGS_PATH = os.getenv("LOGS_PATH", FRIENDHOST_LOGS_BASE_PADRAO)
 TXT_BASE_PATH = os.getenv("TXT_BASE_PATH", LOGS_PATH)
 PLAYERS_DB_PATH = os.getenv("PLAYERS_DB_PATH", os.path.join(PZ_SAVE_BASE_PADRAO, "players.db"))
 WHITELIST_DB_PATH = os.getenv("WHITELIST_DB_PATH", os.path.join(PZ_DB_BASE_PADRAO, "OrganicRP.db"))
-CAMINHO_MORTES = os.getenv("CAMINHO_MOD_MORTES", os.path.join(CSV_BASE_PATH, "Servidor", "deaths.csv"))
-CAMINHO_EVENTOS = os.getenv("CAMINHO_MOD_EVENTOS", os.path.join(CSV_BASE_PATH, "Servidor", "event_history.csv"))
-CAMINHO_PLAYERS_ONLINE = os.getenv("CAMINHO_MOD_PLAYERS_ONLINE", os.path.join(CSV_BASE_PATH, "online_players.csv"))
+# Build 42.20 do PZ so permite ao Lua gravar em extensoes de texto aprovadas, entao
+# o FriendHost passou a escrever "*.csv.txt". O conteudo continua CSV com ';'.
+# Os nomes legados ficam como fallback para servidor que ainda use o mod antigo.
+CAMINHO_MORTES = os.getenv("CAMINHO_MOD_MORTES", os.path.join(CSV_BASE_PATH, "Servidor", "deaths.csv.txt"))
+CAMINHO_EVENTOS = os.getenv("CAMINHO_MOD_EVENTOS", os.path.join(CSV_BASE_PATH, "Servidor", "event_history.csv.txt"))
+CAMINHO_PLAYERS_ONLINE = os.getenv("CAMINHO_MOD_PLAYERS_ONLINE", os.path.join(CSV_BASE_PATH, "Servidor", "players_online.csv.txt"))
+
+NOMES_ARQUIVO_MORTES = ("deaths.csv.txt", "deaths.csv")
+NOMES_ARQUIVO_EVENTOS = ("event_history.csv.txt", "event_history.csv")
+NOMES_ARQUIVO_ONLINE = ("players_online.csv.txt", "players_online.csv", "online_players.csv.txt", "online_players.csv")
 CANAL_MORTES_ID = os.getenv("CANAL_MORTES_ID")
 CANAL_EVENTOS_ID = os.getenv("CANAL_EVENTOS_ID")
 CANAL_VIDAS_ID = os.getenv("CANAL_VIDAS_ID")
@@ -770,28 +778,39 @@ def montar_embed_registro_personagem(guild, membro, registro):
 
     return embed
 
-def caminhos_players_online_friendhost():
-    candidatos = [
-        CAMINHO_PLAYERS_ONLINE,
-        os.path.join(CSV_BASE_PATH, "online_players.csv"),
-        os.path.join(CSV_BASE_PATH, "Servidor", "online_players.csv"),
-    ]
+def localizar_arquivos_mod(caminho_configurado, nomes_aceitos):
+    """Acha um arquivo de dados do FriendHost testando os nomes conhecidos
+    (novos em .csv.txt e os legados em .csv) e varrendo a pasta do mod.
+    Devolve os existentes, do mais recente para o mais antigo."""
+    candidatos = [caminho_configurado]
+    for base in (os.path.join(CSV_BASE_PATH, "Servidor"), CSV_BASE_PATH):
+        for nome in nomes_aceitos:
+            candidatos.append(os.path.join(base, nome))
 
+    nomes_baixos = {nome.lower() for nome in nomes_aceitos}
     with suppress(Exception):
         for raiz, _, arquivos in os.walk(CSV_BASE_PATH):
             for arquivo in arquivos:
-                if arquivo.lower() == "online_players.csv":
+                if arquivo.lower() in nomes_baixos:
                     candidatos.append(os.path.join(raiz, arquivo))
 
     vistos = set()
     existentes = []
     for caminho in candidatos:
+        if not caminho:
+            continue
         caminho = os.path.abspath(caminho)
         if caminho in vistos or not os.path.exists(caminho):
             continue
         vistos.add(caminho)
         existentes.append(caminho)
+
+    with suppress(Exception):
+        existentes.sort(key=os.path.getmtime, reverse=True)
     return existentes
+
+def caminhos_players_online_friendhost():
+    return localizar_arquivos_mod(CAMINHO_PLAYERS_ONLINE, NOMES_ARQUIVO_ONLINE)
 
 def limpar_campo_csv(valor):
     return str(valor or "").replace('"', '').strip()
@@ -1123,40 +1142,8 @@ async def expulsar_jogador_sem_call_ingame(nome_personagem):
 
     return False, ultimo_erro or "não consegui expulsar o jogador"
 
-EXTENSOES_MORTE = (".txt", ".csv", ".log")
-NOMES_ARQUIVO_MORTE = ("death", "morte", "died")
-
 def caminhos_mortes_friendhost():
-    """Localiza o arquivo de mortes do mod. O mod ja usou .csv e hoje usa .txt,
-    entao a busca aceita as duas extensoes em vez de fixar uma."""
-    candidatos = [CAMINHO_MORTES]
-    for base in (CSV_BASE_PATH, os.path.join(CSV_BASE_PATH, "Servidor")):
-        for extensao in EXTENSOES_MORTE:
-            candidatos.append(os.path.join(base, f"deaths{extensao}"))
-            candidatos.append(os.path.join(base, f"death{extensao}"))
-
-    with suppress(Exception):
-        for raiz, _, arquivos in os.walk(CSV_BASE_PATH):
-            for arquivo in arquivos:
-                nome = arquivo.lower()
-                if nome.endswith(EXTENSOES_MORTE) and any(p in nome for p in NOMES_ARQUIVO_MORTE):
-                    candidatos.append(os.path.join(raiz, arquivo))
-
-    vistos = set()
-    existentes = []
-    for caminho in candidatos:
-        if not caminho:
-            continue
-        caminho = os.path.abspath(caminho)
-        if caminho in vistos or not os.path.exists(caminho):
-            continue
-        vistos.add(caminho)
-        existentes.append(caminho)
-
-    # Mais recente primeiro: se o mod trocou de arquivo, o novo vem na frente.
-    with suppress(Exception):
-        existentes.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return existentes
+    return localizar_arquivos_mod(CAMINHO_MORTES, NOMES_ARQUIVO_MORTES)
 
 def caminhos_logs_morte_friendhost(max_arquivos=40):
     bases = [LOGS_PATH, TXT_BASE_PATH]
@@ -1230,27 +1217,40 @@ def campos_estruturados_morte(linha):
             return [campo.strip().strip('"').strip() for campo in linha.split(separador)]
     return []
 
+# Formato do LogExtender do FriendHost. A linha final fica assim:
+#   [06-08-26 14:23:11.123] [Fulano] [PLAYER] 76561198... "Fulano" death perks={...}
+# As acoes possiveis sao death / connected / levelup / tick, e o MESMO arquivo
+# recebe [CHAT], [CMD] etc. Por isso a acao precisa ser lida com precisao: se o
+# jogador escrever "morri" no chat, isso NAO pode virar uma morte.
+RE_ACAO_PLAYER_LOGEXTENDER = re.compile(r'\[PLAYER\]\s+\S+\s+"([^"]*)"\s+([A-Za-z]+)')
+FILEMASKS_LOGEXTENDER = {
+    "CHAT", "USER", "CMD", "ITEM", "MAP", "PVP", "VEHICLE", "PLAYER",
+    "ADMIN", "SAFEHOUSE", "CRAFT", "MAP_ALTERNATIVE", "BRUSHTOOL",
+}
+RE_FILEMASK = re.compile(r"\[([A-Z][A-Z_]{2,19})\]")
+
 def nomes_na_linha_morte(linha):
     """Nomes de personagem citados numa linha de morte.
 
-    Cobre os dois formatos que o mod ja usou:
-      - estruturado por ';' -> colunas 4 (login) e 5 (nome do personagem)
-      - log em texto        -> nome entre aspas ou antes de 'died'/'morreu'
+    IMPORTANTE: o CSV do mod ordena as colunas ALFABETICAMENTE pelo nome do
+    campo (ADGetCSVHeader/ADGetCSVLine). Basta o mod adicionar um campo novo
+    para as posicoes mudarem. Por isso nao existe indice fixo aqui: devolvemos
+    todos os campos de texto como candidatos e a comparacao e feita por valor.
     """
     linha = linha or ""
     nomes = []
+
+    # 1) Log do LogExtender: nome vem entre aspas, logo antes da acao.
+    correspondencia = RE_ACAO_PLAYER_LOGEXTENDER.search(linha)
+    if correspondencia:
+        return _limpar_nomes_morte([correspondencia.group(1)])
+
+    # 2) CSV do mod (deaths.csv.txt): qualquer campo de texto pode ser o nome.
     campos = campos_estruturados_morte(linha)
-
-    if len(campos) >= 6:
-        for indice in (4, 5):
-            if campos[indice]:
-                nomes.append(campos[indice])
-        if nomes:
-            return _limpar_nomes_morte(nomes)
-
     if campos:
         nomes.extend(campos)
 
+    # 3) Log em texto de outros formatos.
     nomes.extend(re.findall(r'"([^"]{2,40})"', linha))
     for padrao in (
         r"(?i)\b(?:user|player|jogador)\s+([A-Za-z0-9_][A-Za-z0-9_ ]{1,39}?)\s+(?:died|is dead|morreu)",
@@ -1291,11 +1291,40 @@ def extrair_morte_da_linha(linha):
     if not linha.strip():
         return None
 
-    estruturada = len(campos_estruturados_morte(linha)) >= 6
-    if not estruturada and not linha_indica_morte(linha):
+    # 1) Log do LogExtender: a acao decide. Só "death" conta.
+    correspondencia = RE_ACAO_PLAYER_LOGEXTENDER.search(linha)
+    if correspondencia:
+        if correspondencia.group(2).lower() not in ("death", "died", "dead"):
+            return None  # connected / levelup / tick
+        return _limpar_nomes_morte([correspondencia.group(1)])
+
+    # 2) Outras categorias do LogExtender ([CHAT], [CMD]...) nunca sao morte.
+    #    Sem isso, alguem escrevendo "morri" no chat liberaria o registro.
+    if any(mask in FILEMASKS_LOGEXTENDER for mask in RE_FILEMASK.findall(linha)):
+        return None
+
+    # 3) CSV do mod. O deaths.csv.txt so recebe linha quando isAlive=false,
+    #    entao toda linha de dados ali ja e uma morte.
+    if len(campos_estruturados_morte(linha)) >= 4:
+        return nomes_na_linha_morte(linha)
+
+    # 4) Texto livre: exige marcador explicito de morte.
+    if not linha_indica_morte(linha):
         return None
 
     return nomes_na_linha_morte(linha)
+
+def filtrar_nomes_registrados(nomes):
+    """Mantem apenas os nomes que correspondem a um personagem registrado.
+
+    O CSV do mod traz varias colunas (data, profissao, coordenada...). Sem esse
+    filtro o monitor gravaria lixo como 'morto' no banco de status."""
+    _, indice_norm, indice_compacto = construir_indices_personagens_atuais()
+    encontrados = []
+    for nome in nomes:
+        if normalizar_chave_personagem(nome) in indice_norm or compactar_chave_personagem(nome) in indice_compacto:
+            encontrados.append(nome)
+    return encontrados
 
 def nome_bate_com_morte(nome_personagem, nomes_linha, linha):
     nome_norm = normalizar_chave_personagem(nome_personagem)
@@ -2697,6 +2726,10 @@ async def monitorar_mortes():
     caminho_mortes = caminhos[0]
 
     print(f"📡 [VIGIA] Monitoramento de Mortes Ativado em {caminho_mortes}!")
+    # Guarda as ultimas linhas ja anunciadas: se o mod reescrever o arquivo,
+    # o bot nao repete a mesma morte no canal.
+    mortes_anunciadas = deque(maxlen=200)
+
     with open(caminho_mortes, 'r', encoding='utf-8', errors='replace') as f:
         f.seek(0, 2)
         posicao = f.tell()
@@ -2706,9 +2739,13 @@ async def monitorar_mortes():
                 # A FriendHost rotaciona/limpa os logs. Se o arquivo encolheu,
                 # o tail antigo pararia de ver mortes para sempre em silencio.
                 if detectar_rotacao_arquivo(caminho_mortes, posicao):
-                    print("[VIGIA] Log de mortes foi rotacionado; voltando para o inicio do arquivo.")
-                    f.seek(0)
-                    posicao = 0
+                    # O mod limita o historico reescrevendo o arquivo inteiro.
+                    # Voltar ao inicio faria o bot reanunciar mortes antigas,
+                    # entao continuamos do fim. A checagem do anti-fraude le o
+                    # arquivo completo na hora do registro, nada se perde.
+                    print("[VIGIA] Arquivo de mortes encolheu (rotacao/limite do mod); seguindo do fim.")
+                    f.seek(0, 2)
+                    posicao = f.tell()
 
                 linha = f.readline()
                 posicao = f.tell()
@@ -2717,12 +2754,20 @@ async def monitorar_mortes():
                     await asyncio.sleep(1)
                     continue
 
-                nomes_mortos = extrair_morte_da_linha(linha)
-                if nomes_mortos is None:
+                nomes_detectados = extrair_morte_da_linha(linha)
+                if nomes_detectados is None:
                     continue
+
+                assinatura = linha.strip()
+                if assinatura in mortes_anunciadas:
+                    continue
+
+                nomes_mortos = filtrar_nomes_registrados(nomes_detectados) or nomes_detectados[:1]
                 if not nomes_mortos:
-                    print(f"[VIGIA] Linha de morte sem nome reconhecido: {linha.strip()[:200]}")
+                    print(f"[VIGIA] Linha de morte sem nome reconhecido: {assinatura[:200]}")
                     continue
+
+                mortes_anunciadas.append(assinatura)
 
                 # Marca todas as variacoes (login e nome do personagem) para o
                 # anti-fraude achar depois, venha a ficha com qual dos dois vier.
