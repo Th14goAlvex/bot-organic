@@ -2067,6 +2067,68 @@ class FichaModal(discord.ui.Modal, title="Ficha de Personagem"):
             else:
                 await interaction.response.send_message(mensagem, ephemeral=True)
 
+aviso_formato_antigo_em = {}
+INTERVALO_AVISO_FORMATO_ANTIGO = 60
+
+async def avisar_ficha_formato_antigo(canal, membro):
+    """Ficha digitada no chat nao vale mais. Explica e devolve o botao.
+    Com cooldown: quem colar a ficha varias vezes nao recebe uma parede de avisos."""
+    agora = time.monotonic()
+    ultimo = aviso_formato_antigo_em.get(canal.id, 0)
+    if agora - ultimo < INTERVALO_AVISO_FORMATO_ANTIGO:
+        return
+    aviso_formato_antigo_em[canal.id] = agora
+
+    with suppress(Exception):
+        await canal.send(
+            f"🚫 {membro.mention}, **fichas digitadas no chat não são mais aceitas.**\n\n"
+            "Use o botão **📝 Preencher Ficha do Personagem** abaixo. Ele abre um formulário "
+            "com os campos separados, então não tem como errar o formato.\n"
+            "*O que você escreveu aqui foi ignorado — nada foi registrado e nenhuma vida foi gasta.*"
+        )
+    with suppress(Exception):
+        await enviar_painel_ficha(canal, membro)
+
+async def descartar_fichas_formato_antigo():
+    """Remove da fila as fichas que entraram digitadas no chat, antes do formato
+    antigo ser bloqueado. Ficha do Modal guarda conteudo_ficha; a digitada nao.
+    Cada jogador afetado e avisado no proprio ticket para refazer pelo botao."""
+    antigas = [
+        p for p in carregar_fila_registro()
+        if not (p.get("conteudo_ficha") or "").strip()
+    ]
+    if not antigas:
+        return 0
+
+    removidas = 0
+    for entrada in antigas:
+        canal_id = entrada.get("canal_id")
+        with suppress(Exception):
+            await cancelar_processamento_ficha(canal_id, entrada.get("msg_id"))
+        if remover_da_fila_registro(canal_id, entrada.get("msg_id")):
+            removidas += 1
+
+        canal = bot.get_channel(canal_id) if canal_id else None
+        if not canal:
+            continue
+
+        membro = None
+        with suppress(Exception):
+            membro = canal.guild.get_member(entrada.get("autor_id")) if canal.guild else None
+        with suppress(Exception):
+            await canal.send(
+                f"⚠ {membro.mention if membro else 'Atenção'}, sua ficha foi enviada **digitada no chat**, "
+                "formato que não é mais aceito.\n\n"
+                "Ela **não foi registrada** e **não gastou vida**. "
+                "Reenvie pelo botão **📝 Preencher Ficha do Personagem** abaixo."
+            )
+        if membro:
+            with suppress(Exception):
+                await enviar_painel_ficha(canal, membro)
+
+    print(f"[FICHAS] {removidas} ficha(s) no formato antigo removida(s) da fila.")
+    return removidas
+
 async def enviar_painel_ficha(canal, membro):
     """Mensagem de abertura do ticket de personagem: ja avisa quantas vidas o
     jogador tem e so mostra o botao se ele ainda puder criar."""
@@ -3262,8 +3324,9 @@ async def varrer_tickets_abertos_fichas():
                 if not formulario:
                     continue
 
-                if agendar_processamento_ficha(formulario):
-                    total_encontradas += 1
+                # Nao registra ficha digitada: apenas avisa para refazer no botao.
+                total_encontradas += 1
+                await avisar_ficha_formato_antigo(canal, formulario.author)
                 await asyncio.sleep(1)
             except discord.Forbidden:
                 print(f"[FICHAS] Sem permissao para varrer o canal {canal.id}.")
@@ -3271,7 +3334,7 @@ async def varrer_tickets_abertos_fichas():
                 print(f"[FICHAS] Falha ao varrer o canal {canal.id}: {erro}")
 
     if total_encontradas:
-        print(f"[FICHAS] Varredura inicial encontrou {total_encontradas} ficha(s) aberta(s).")
+        print(f"[FICHAS] Varredura inicial encontrou {total_encontradas} ficha(s) no formato antigo; jogadores avisados.")
 
 async def agendar_remocao_vip(guild_id, user_id, cargo_id, canal_id, segundos_espera, chave_vip, vencimento_esperado):
     try:
@@ -5170,6 +5233,9 @@ async def on_ready():
         tarefa_retomar_analises = bot.loop.create_task(retomar_fichas_em_analise())
     if tarefa_varredura_fichas is None or tarefa_varredura_fichas.done():
         tarefa_varredura_fichas = bot.loop.create_task(varrer_tickets_abertos_fichas())
+    with suppress(Exception):
+        await descartar_fichas_formato_antigo()
+
     descartadas = manter_apenas_ficha_mais_recente()
     if descartadas:
         print(f"[FICHAS] {len(descartadas)} ficha(s) duplicada(s) removida(s) na inicializacao.")
@@ -5226,7 +5292,8 @@ async def on_message(message):
 
     if categoria_processa_ficha_pos_morte(getattr(message.channel, "category", None)):
         if mensagem_parece_formulario_ficha(message):
-            agendar_processamento_ficha(message)
+            # Formato antigo desativado: so o formulario do botao vale.
+            await avisar_ficha_formato_antigo(message.channel, message.author)
             return
 
     if message.content.startswith('!zomboid'):
