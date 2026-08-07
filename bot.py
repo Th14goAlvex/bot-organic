@@ -2279,6 +2279,15 @@ class TicketButton(discord.ui.View):
         self.add_item(botao)
 
     async def abrir_ticket_btn(self, interaction: discord.Interaction):
+        # O Discord exige resposta em ate 3 segundos. Criar categoria e canal
+        # sao das chamadas mais limitadas por rate limit: com varios jogadores
+        # clicando ao mesmo tempo isso passa de 3s e o botao falha. O defer
+        # reserva a interacao antes de comecar o trabalho pesado.
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except discord.HTTPException:
+            return
+
         paineis = carregar_paineis()
         msg_id = str(interaction.message.id)
         config = paineis.get(msg_id, {"categoria": " 🎫 ATENDIMENTO", "mensagem": "Nossa equipe já foi notificada. Por favor, mande suas informações."})
@@ -2299,10 +2308,18 @@ class TicketButton(discord.ui.View):
         nome_canal = f"ticket-{interaction.user.name.lower()}"
         
         canal_existente = discord.utils.get(categoria.text_channels, name=nome_canal)
-        if canal_existente: return await interaction.response.send_message(f" Você já tem um ticket aberto nesta categoria: {canal_existente.mention}.", ephemeral=True)
+        if canal_existente:
+            return await interaction.followup.send(f"Você já tem um ticket aberto nesta categoria: {canal_existente.mention}.", ephemeral=True)
 
-        canal_ticket = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
-        await interaction.response.send_message(f"✅ Seu ticket foi aberto: {canal_ticket.mention}", ephemeral=True)
+        try:
+            canal_ticket = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
+        except discord.Forbidden:
+            return await interaction.followup.send("❌ Não tenho permissão para criar o canal do ticket. Avise a staff.", ephemeral=True)
+        except discord.HTTPException as erro:
+            print(f"[TICKET] Falha ao criar canal para {interaction.user}: {erro}")
+            return await interaction.followup.send("❌ O Discord recusou a criação do ticket agora. Tente de novo em alguns segundos.", ephemeral=True)
+
+        await interaction.followup.send(f"✅ Seu ticket foi aberto: {canal_ticket.mention}", ephemeral=True)
         await canal_ticket.send(f"👋 **Olá, {interaction.user.mention}!**\n\n{texto_msg}\n\n*(Staff: Use `/fechar_ticket`)*")
 
         if categoria_processa_ficha_pos_morte(categoria):
@@ -4107,14 +4124,44 @@ async def aprovar_ficha(interaction: discord.Interaction):
         except Exception as erro:
             print(f"[FICHAS] Falha ao aprovar ficha em analise: {erro}")
 
-    # 2) Sem analise em andamento: procura uma ficha digitada nas ultimas mensagens.
+    # 2) Ficha guardada na fila duravel: esperando a abertura agendada ou o
+    #    servidor subir. E aqui que ela fica hoje, inclusive a vinda do Modal.
+    entrada = next(
+        (p for p in carregar_fila_registro() if p.get("canal_id") == interaction.channel.id),
+        None,
+    )
+    if entrada:
+        try:
+            alvo = await reconstruir_ficha_salva(interaction.channel, entrada)
+            await cancelar_processamento_ficha(entrada.get("canal_id"), entrada.get("msg_id"))
+
+            estado = entrada.get("estado")
+            if estado == ESTADO_AGUARDANDO_ABERTURA:
+                motivo = "estava guardada esperando o horário de abertura"
+            elif estado == ESTADO_AGUARDANDO_SERVIDOR:
+                motivo = "estava na fila esperando o servidor"
+            else:
+                motivo = "estava na fila de registro"
+
+            await interaction.followup.send(
+                f"⚙ **Modo Admin:** a ficha {motivo}. Ignorando horário, servidor e anti-fraude — aprovando agora..."
+            )
+            agendar_processamento_ficha(alvo, bypass=True, checar_online=False)
+            return
+        except Exception as erro:
+            print(f"[FICHAS] Falha ao aprovar ficha da fila: {erro}")
+
+    # 3) Sem nada guardado: procura uma ficha digitada nas ultimas mensagens.
     async for msg in interaction.channel.history(limit=15):
         if mensagem_parece_formulario_ficha(msg) and msg.author != bot.user:
             await interaction.followup.send("⚙ **Modo Admin:** Ignorando banco de dados e forçando aprovação instantânea...")
             agendar_processamento_ficha(msg, bypass=True, checar_online=False)
             return
 
-    await interaction.followup.send("❌ Não encontrei nenhuma ficha de jogador nas últimas mensagens nem em análise neste ticket.")
+    await interaction.followup.send(
+        "❌ Não encontrei nenhuma ficha neste ticket — nem em análise, nem na fila, nem nas últimas 15 mensagens. "
+        "*Peça para o jogador enviar a ficha primeiro.*"
+    )
 
 @bot.tree.command(name="agendar_abertura", description="🗓 Marca a data/hora em que a aprovação de personagens começa")
 @app_commands.describe(
@@ -4131,12 +4178,11 @@ async def agendar_abertura(interaction: discord.Interaction, hora: str = None, d
     aguardando = [p for p in fila if p.get("estado") == ESTADO_AGUARDANDO_ABERTURA]
 
     if cancelar:
-        config = carregar_config_abertura()
-        tinha = config.get("abertura_epoch")
-        config.pop("abertura_epoch", None)
-        config["liberado_em"] = datetime.now().isoformat()
-        config["liberado_por"] = str(interaction.user)
-        salvar_config_abertura(config)
+        tinha = timestamp_abertura_registros()
+        salvar_config_abertura({
+            "liberado_em": datetime.now().isoformat(),
+            "liberado_por": str(interaction.user),
+        })
 
         if not tinha:
             return await interaction.response.send_message("ℹ Não havia agendamento — os registros já estavam abertos.", ephemeral=True)
@@ -4172,11 +4218,15 @@ async def agendar_abertura(interaction: discord.Interaction, hora: str = None, d
         return await interaction.response.send_message(
             f"❌ Esse horário já passou (<t:{int(epoch)}:F>). Informe um momento no futuro.", ephemeral=True)
 
-    config = carregar_config_abertura()
-    config["abertura_epoch"] = epoch
-    config["agendado_em"] = datetime.now().isoformat()
-    config["agendado_por"] = str(interaction.user)
-    salvar_config_abertura(config)
+    # Agendamento novo SUBSTITUI o anterior por completo: o arquivo e reescrito
+    # do zero, sem herdar nada da marcacao antiga.
+    anterior = timestamp_abertura_registros()
+    salvar_config_abertura({
+        "abertura_epoch": epoch,
+        "agendado_em": datetime.now().isoformat(),
+        "agendado_por": str(interaction.user),
+        "substituiu_epoch": anterior,
+    })
 
     marca = int(epoch)
     embed = discord.Embed(
@@ -4193,6 +4243,12 @@ async def agendar_abertura(interaction: discord.Interaction, hora: str = None, d
         ),
         inline=False,
     )
+    if anterior:
+        embed.add_field(
+            name="♻ Agendamento anterior",
+            value=f"<t:{int(anterior)}:F> foi **apagado** e não vale mais.",
+            inline=False,
+        )
     if aguardando or fila:
         embed.add_field(name="Já guardadas", value=f"**{len(aguardando)}** ficha(s) esperando a abertura", inline=True)
     embed.set_footer(text=f"Agendado por {interaction.user.display_name} · horário de Brasília")
