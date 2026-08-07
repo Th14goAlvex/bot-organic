@@ -20,6 +20,10 @@ status_jogadores.json
 vips.json
 sorteios.json
 config_vidas.json
+versao_bot.json
+
+# Backup automatico do /bot_atualizar
+backup_update/
 
 # CONFIGURACAO (versionada de proposito): sem estes arquivos os botoes de
 # ticket param de funcionar e o bot cria uma mensagem de status duplicada.

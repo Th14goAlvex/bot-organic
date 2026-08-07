@@ -51,12 +51,35 @@ python bot.py
 
 | Comando | O que faz |
 |---|---|
+| `/bot_atualizar` | Baixa a última versão deste repositório e reinicia o bot |
+| `/versao_bot` | Mostra a versão instalada e se há atualização |
+| `/diagnostico_mortes` | Mostra qual arquivo de mortes o bot lê e como interpreta |
+| `/configurar_vidas` · `/adicionar_vidas` · `/ver_vidas` | Sistema de vidas por temporada |
 | `/fila_registros` | Mostra as fichas na fila esperando o servidor abrir |
 | `/aprovar_ficha` | Força a aprovação da ficha do ticket, ignorando o anti-fraude |
 | `/historico_registro` | Consulta o último registro de personagem de um jogador |
 | `/enviar_formulario` | Posta o botão do formulário de ficha no canal |
 | `/iniciar_reuniao` · `/encerrar_reuniao` | Grava a call e gera a ata |
 | `!deploy` | Sincroniza os slash commands |
+
+## Atualização remota
+
+Depois de fazer deploy na host, novas versões são aplicadas pelo próprio Discord
+com `/bot_atualizar` — não é preciso acesso ao servidor.
+
+O comando baixa a última versão deste repositório, **valida que o código compila
+antes de gravar qualquer coisa**, guarda um backup do que foi substituído em
+`backup_update/` e só então reinicia o processo. Se o download falhar, o código
+vier quebrado ou a instalação de dependências der erro, ele restaura o backup e
+o bot continua na versão anterior.
+
+O updater troca **apenas arquivos `.py` e o `requirements.txt`**. Nenhum `.json`
+e nenhum `.env` é tocado — mesmo os que existem neste repositório, como o
+`paineis.json`.
+
+Todo o estado em andamento sobrevive ao reinício: fichas na fila, análises de
+personagem em curso, VIPs com vencimento marcado e sorteios ativos são retomados
+automaticamente quando o bot volta.
 
 ## Dados e privacidade
 

@@ -4,8 +4,12 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ext import voice_recv
 import os
+import sys
+import shutil
+import subprocess
 import wave
 import asyncio
+import aiohttp
 import itertools
 import json
 import re
@@ -109,6 +113,20 @@ ARQUIVO_REGISTROS_PERSONAGENS = os.path.join(BASE_DIR, "registros_personagens.js
 ARQUIVO_TEMPLATES = os.path.join(BASE_DIR, "templates_mensagens.json")
 ARQUIVO_FICHAS_EM_ANALISE = os.path.join(BASE_DIR, "fichas_em_analise.json")
 ARQUIVO_CONFIG_VIDAS = os.path.join(BASE_DIR, "config_vidas.json")
+ARQUIVO_VERSAO_BOT = os.path.join(BASE_DIR, "versao_bot.json")
+PASTA_BACKUP_UPDATE = os.path.join(BASE_DIR, "backup_update")
+
+# --- AUTO-ATUALIZACAO PELO GITHUB ---
+# O repositorio e FIXO de proposito. Se viesse por parametro do comando,
+# qualquer admin poderia mandar o bot baixar e executar codigo de outro lugar.
+REPO_GITHUB = os.getenv("REPO_GITHUB", "Th14goAlvex/bot-organic")
+BRANCH_GITHUB = os.getenv("BRANCH_GITHUB", "main")
+
+# Regra de ouro do updater: ele NUNCA toca em .json, .env ou qualquer dado.
+# So codigo e dependencias sao substituidos.
+EXTENSOES_ATUALIZAVEIS = (".py",)
+ARQUIVOS_ATUALIZAVEIS_EXTRAS = ("requirements.txt",)
+NUNCA_ATUALIZAR = (".json", ".env", ".db", ".wav", ".log", ".bak", ".tmp")
 
 ESPERA_ANALISE_FICHA_SEGUNDOS = 180
 
@@ -526,6 +544,150 @@ def texto_vidas_restantes(vidas):
         return "💀 **Você não tem mais vidas.** Este foi seu último personagem da temporada."
     plural = "vida" if vidas["restantes"] == 1 else "vidas"
     return f"❤ Você ainda tem **{vidas['restantes']} {plural}** (personagens que ainda pode criar depois deste)."
+
+# --- AUTO-ATUALIZACAO ---
+
+def carregar_versao_bot():
+    return carregar_json_seguro(ARQUIVO_VERSAO_BOT, {}) or {}
+
+def salvar_versao_bot(dados):
+    salvar_json_seguro(ARQUIVO_VERSAO_BOT, dados, ensure_ascii=False)
+
+def arquivo_e_atualizavel(caminho_repo):
+    """Decide se um arquivo do repositorio pode ser sobrescrito na atualizacao.
+    Dado do bot (json), segredo (.env) e banco NUNCA entram aqui."""
+    nome = caminho_repo.lower()
+
+    if nome.endswith(NUNCA_ATUALIZAR):
+        return False
+    if any(parte in nome for parte in ("/.", "\\.")) or nome.startswith("."):
+        return False
+    if nome.endswith(EXTENSOES_ATUALIZAVEIS):
+        return True
+    return os.path.basename(nome) in ARQUIVOS_ATUALIZAVEIS_EXTRAS
+
+async def consultar_ultimo_commit():
+    """Ultimo commit do repositorio. Devolve (dados, erro)."""
+    url = f"https://api.github.com/repos/{REPO_GITHUB}/commits/{BRANCH_GITHUB}"
+    cabecalhos = {"Accept": "application/vnd.github+json", "User-Agent": "OrganicRP-Bot"}
+    try:
+        tempo = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=tempo) as sessao:
+            async with sessao.get(url, headers=cabecalhos) as resposta:
+                if resposta.status == 404:
+                    return None, f"Repositório `{REPO_GITHUB}` ou branch `{BRANCH_GITHUB}` não encontrado."
+                if resposta.status == 403:
+                    return None, "GitHub recusou (limite de requisições). Tente de novo em alguns minutos."
+                if resposta.status != 200:
+                    return None, f"GitHub respondeu HTTP {resposta.status}."
+                dados = await resposta.json()
+    except asyncio.TimeoutError:
+        return None, "O GitHub demorou demais para responder."
+    except Exception as erro:
+        return None, f"Falha ao consultar o GitHub: {erro}"
+
+    commit = dados.get("commit", {})
+    return {
+        "sha": dados.get("sha", ""),
+        "mensagem": (commit.get("message") or "").strip().splitlines()[0] if commit.get("message") else "",
+        "autor": (commit.get("author") or {}).get("name", "?"),
+        "data": (commit.get("author") or {}).get("date", ""),
+    }, None
+
+async def listar_arquivos_repo(sha):
+    """Arquivos de codigo do repositorio nesse commit."""
+    url = f"https://api.github.com/repos/{REPO_GITHUB}/git/trees/{sha}?recursive=1"
+    cabecalhos = {"Accept": "application/vnd.github+json", "User-Agent": "OrganicRP-Bot"}
+    try:
+        tempo = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=tempo) as sessao:
+            async with sessao.get(url, headers=cabecalhos) as resposta:
+                if resposta.status != 200:
+                    return None, f"Não consegui listar os arquivos (HTTP {resposta.status})."
+                dados = await resposta.json()
+    except Exception as erro:
+        return None, f"Falha ao listar arquivos: {erro}"
+
+    arquivos = [
+        item["path"] for item in dados.get("tree", [])
+        if item.get("type") == "blob" and arquivo_e_atualizavel(item.get("path", ""))
+    ]
+    return arquivos, None
+
+async def baixar_arquivo_repo(caminho_repo, sha):
+    url = f"https://raw.githubusercontent.com/{REPO_GITHUB}/{sha}/{caminho_repo}"
+    try:
+        tempo = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=tempo) as sessao:
+            async with sessao.get(url, headers={"User-Agent": "OrganicRP-Bot"}) as resposta:
+                if resposta.status != 200:
+                    return None, f"HTTP {resposta.status} ao baixar {caminho_repo}"
+                return await resposta.read(), None
+    except Exception as erro:
+        return None, f"Falha ao baixar {caminho_repo}: {erro}"
+
+def validar_codigo_python(conteudo, nome):
+    """Trava de seguranca: codigo quebrado NAO pode ser gravado. Se o bot
+    reiniciar com erro de sintaxe, ele morre e ninguem consegue mais subir
+    nada remotamente."""
+    if not conteudo or not conteudo.strip():
+        return f"`{nome}` veio vazio do GitHub."
+    try:
+        texto = conteudo.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"`{nome}` não é UTF-8 válido."
+    try:
+        compile(texto, nome, "exec")
+    except SyntaxError as erro:
+        return f"`{nome}` tem erro de sintaxe (linha {erro.lineno}): {erro.msg}"
+    return None
+
+def preparar_pasta_backup():
+    with suppress(Exception):
+        if os.path.isdir(PASTA_BACKUP_UPDATE):
+            shutil.rmtree(PASTA_BACKUP_UPDATE)
+    os.makedirs(PASTA_BACKUP_UPDATE, exist_ok=True)
+
+def salvar_backup_arquivo(caminho_local):
+    if not os.path.exists(caminho_local):
+        return
+    destino = os.path.join(PASTA_BACKUP_UPDATE, os.path.relpath(caminho_local, BASE_DIR))
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    shutil.copy2(caminho_local, destino)
+
+def restaurar_backup():
+    """Desfaz a atualizacao se algo falhar no meio."""
+    if not os.path.isdir(PASTA_BACKUP_UPDATE):
+        return 0
+    restaurados = 0
+    for raiz, _, arquivos in os.walk(PASTA_BACKUP_UPDATE):
+        for arquivo in arquivos:
+            origem = os.path.join(raiz, arquivo)
+            destino = os.path.join(BASE_DIR, os.path.relpath(origem, PASTA_BACKUP_UPDATE))
+            with suppress(Exception):
+                os.makedirs(os.path.dirname(destino), exist_ok=True)
+                shutil.copy2(origem, destino)
+                restaurados += 1
+    return restaurados
+
+def instalar_dependencias():
+    try:
+        resultado = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", os.path.join(BASE_DIR, "requirements.txt")],
+            capture_output=True, text=True, timeout=600,
+        )
+        if resultado.returncode != 0:
+            return (resultado.stderr or resultado.stdout or "").strip()[-500:]
+        return None
+    except Exception as erro:
+        return str(erro)
+
+def reiniciar_processo_bot():
+    """Troca a imagem do processo pelo codigo novo. Funciona tanto rodando
+    solto quanto sob systemd/pterodactyl."""
+    print("[UPDATE] Reiniciando o processo para carregar o codigo novo...")
+    sys.stdout.flush()
+    os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:])
 
 def carregar_templates():
     return carregar_json_seguro(ARQUIVO_TEMPLATES, {})
@@ -3812,6 +3974,186 @@ async def aprovar_ficha(interaction: discord.Interaction):
             return
 
     await interaction.followup.send("❌ Não encontrei nenhuma ficha de jogador nas últimas mensagens nem em análise neste ticket.")
+
+@bot.tree.command(name="versao_bot", description="ℹ Mostra a versão instalada e se existe atualização no GitHub")
+@app_commands.default_permissions(administrator=True)
+async def versao_bot(interaction: discord.Interaction):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    local = carregar_versao_bot()
+    remoto, erro = await consultar_ultimo_commit()
+
+    embed = discord.Embed(title="ℹ Versão do Bot", color=discord.Color.blurple())
+    embed.add_field(name="Repositório", value=f"`{REPO_GITHUB}` (branch `{BRANCH_GITHUB}`)", inline=False)
+
+    if local.get("sha"):
+        embed.add_field(
+            name="Instalada agora",
+            value=f"`{local['sha'][:7]}` — {local.get('mensagem') or 'sem descrição'}\n*Atualizado em {formatar_data_registro(local.get('atualizado_em'))}*",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Instalada agora", value="Desconhecida (nunca atualizada pelo comando)", inline=False)
+
+    if erro:
+        embed.color = discord.Color.orange()
+        embed.add_field(name="⚠ GitHub", value=erro, inline=False)
+    else:
+        embed.add_field(
+            name="Última no GitHub",
+            value=f"`{remoto['sha'][:7]}` — {remoto['mensagem']}\n*por {remoto['autor']}*",
+            inline=False,
+        )
+        if local.get("sha") == remoto["sha"]:
+            embed.color = discord.Color.green()
+            embed.add_field(name="Situação", value="✅ O bot está atualizado.", inline=False)
+        else:
+            embed.color = discord.Color.gold()
+            embed.add_field(name="Situação", value="🆕 Existe atualização. Use `/bot_atualizar`.", inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="bot_atualizar", description="⬆ Baixa a última versão do GitHub e reinicia o bot")
+@app_commands.describe(
+    apenas_verificar="Só mostra o que mudaria, sem aplicar nada.",
+    forcar="Reinstala mesmo se já estiver na última versão.",
+)
+@app_commands.default_permissions(administrator=True)
+async def bot_atualizar(interaction: discord.Interaction, apenas_verificar: bool = False, forcar: bool = False):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    await interaction.response.defer()
+
+    local = carregar_versao_bot()
+    remoto, erro = await consultar_ultimo_commit()
+    if erro:
+        return await interaction.followup.send(f"❌ **Não consegui consultar o GitHub:** {erro}")
+
+    ja_atualizado = local.get("sha") == remoto["sha"]
+    if ja_atualizado and not forcar and not apenas_verificar:
+        return await interaction.followup.send(
+            f"✅ **O bot já está na última versão** (`{remoto['sha'][:7]}` — {remoto['mensagem']}).\n"
+            f"*Use `forcar:True` se quiser reinstalar mesmo assim.*"
+        )
+
+    arquivos, erro = await listar_arquivos_repo(remoto["sha"])
+    if erro:
+        return await interaction.followup.send(f"❌ {erro}")
+    if not arquivos:
+        return await interaction.followup.send("❌ Nenhum arquivo de código encontrado no repositório.")
+
+    # Estado em disco que vai sobreviver ao reinicio (nada disso e tocado).
+    fila = carregar_fila_registro()
+    analises = carregar_fichas_em_analise()
+
+    if apenas_verificar:
+        embed = discord.Embed(
+            title="🔎 Verificação de Atualização",
+            description=("🆕 Existe uma versão nova." if not ja_atualizado else "✅ Já está na última versão."),
+            color=discord.Color.gold() if not ja_atualizado else discord.Color.green(),
+        )
+        embed.add_field(name="Instalada", value=f"`{(local.get('sha') or 'desconhecida')[:7]}`", inline=True)
+        embed.add_field(name="No GitHub", value=f"`{remoto['sha'][:7]}`", inline=True)
+        embed.add_field(name="Mudança", value=remoto["mensagem"] or "—", inline=False)
+        embed.add_field(name="Arquivos que seriam trocados", value="```" + "\n".join(arquivos[:20]) + "```", inline=False)
+        embed.add_field(
+            name="🔒 Preservado (nunca tocado)",
+            value=f"Todos os `.json` e o `.env`.\nNa fila: **{len(fila)}** ficha(s), **{len(analises)}** em análise.",
+            inline=False,
+        )
+        return await interaction.followup.send(embed=embed)
+
+    msg = await interaction.followup.send(
+        f"⬇ **Baixando a versão `{remoto['sha'][:7]}`** ({len(arquivos)} arquivo(s))...", wait=True
+    )
+
+    # 1) Baixa tudo primeiro e valida ANTES de gravar qualquer coisa.
+    baixados = {}
+    for caminho_repo in arquivos:
+        conteudo, erro = await baixar_arquivo_repo(caminho_repo, remoto["sha"])
+        if erro:
+            return await msg.edit(content=f"❌ **Atualização cancelada:** {erro}\n*Nada foi alterado.*")
+
+        if caminho_repo.lower().endswith(".py"):
+            problema = validar_codigo_python(conteudo, caminho_repo)
+            if problema:
+                return await msg.edit(content=f"❌ **Atualização cancelada:** {problema}\n*Nada foi alterado — o bot continua rodando na versão atual.*")
+
+        baixados[caminho_repo] = conteudo
+
+    # 2) Backup e gravacao.
+    await msg.edit(content=f"💾 **Código validado.** Fazendo backup e aplicando {len(baixados)} arquivo(s)...")
+    try:
+        preparar_pasta_backup()
+        requirements_mudou = False
+
+        for caminho_repo, conteudo in baixados.items():
+            destino = os.path.join(BASE_DIR, caminho_repo.replace("/", os.sep))
+
+            if os.path.exists(destino):
+                with open(destino, "rb") as f:
+                    if f.read() == conteudo:
+                        continue
+            salvar_backup_arquivo(destino)
+
+            os.makedirs(os.path.dirname(destino), exist_ok=True)
+            temporario = destino + ".novo"
+            with open(temporario, "wb") as f:
+                f.write(conteudo)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporario, destino)
+
+            if os.path.basename(caminho_repo).lower() == "requirements.txt":
+                requirements_mudou = True
+    except Exception as falha:
+        restaurados = restaurar_backup()
+        return await msg.edit(content=f"❌ **Falha ao gravar:** {falha}\n🔄 Restaurei {restaurados} arquivo(s) do backup. O bot segue na versão antiga.")
+
+    # 3) Dependencias novas, se houver.
+    if requirements_mudou:
+        await msg.edit(content="📦 **`requirements.txt` mudou.** Instalando dependências... *(pode demorar)*")
+        erro_pip = await asyncio.to_thread(instalar_dependencias)
+        if erro_pip:
+            restaurados = restaurar_backup()
+            return await msg.edit(content=f"❌ **Falha ao instalar dependências:**\n```{erro_pip}```\n🔄 Restaurei {restaurados} arquivo(s). O bot segue na versão antiga.")
+
+    salvar_versao_bot({
+        "sha": remoto["sha"],
+        "mensagem": remoto["mensagem"],
+        "autor": remoto["autor"],
+        "atualizado_em": datetime.now().isoformat(),
+        "atualizado_por": str(interaction.user),
+    })
+
+    embed = discord.Embed(
+        title="✅ Atualização Aplicada — Reiniciando",
+        description=f"**{remoto['mensagem']}**\n`{(local.get('sha') or '???')[:7]}` ➜ `{remoto['sha'][:7]}`",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Arquivos trocados", value=f"`{len(baixados)}`", inline=True)
+    embed.add_field(name="Aplicado por", value=interaction.user.mention, inline=True)
+    embed.add_field(
+        name="🔒 Dados preservados",
+        value=(
+            "Nenhum `.json` ou `.env` foi tocado.\n"
+            f"**{len(fila)}** ficha(s) na fila e **{len(analises)}** em análise continuam garantidas — "
+            "o bot retoma tudo assim que voltar."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="O bot volta em alguns segundos.")
+    await msg.edit(content=None, embed=embed)
+
+    print(f"[UPDATE] Atualizado para {remoto['sha']} por {interaction.user}. Reiniciando...")
+    await asyncio.sleep(2)
+
+    with suppress(Exception):
+        await bot.close()
+    reiniciar_processo_bot()
 
 @bot.tree.command(name="diagnostico_mortes", description="🔎 Mostra o arquivo de mortes que o bot está lendo e como ele interpreta as linhas")
 @app_commands.describe(linhas="Quantas linhas finais mostrar (padrão 5)")
