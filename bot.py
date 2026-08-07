@@ -23,7 +23,7 @@ from array import array
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 from groq import Groq
@@ -114,6 +114,12 @@ ARQUIVO_TEMPLATES = os.path.join(BASE_DIR, "templates_mensagens.json")
 ARQUIVO_FICHAS_EM_ANALISE = os.path.join(BASE_DIR, "fichas_em_analise.json")
 ARQUIVO_CONFIG_VIDAS = os.path.join(BASE_DIR, "config_vidas.json")
 ARQUIVO_VERSAO_BOT = os.path.join(BASE_DIR, "versao_bot.json")
+ARQUIVO_CONFIG_ABERTURA = os.path.join(BASE_DIR, "config_abertura.json")
+
+# Fuso usado para interpretar/mostrar horarios digitados pela staff.
+# -3 = horario de Brasilia. A host pode rodar em UTC, entao nao da para confiar
+# no relogio local do servidor.
+FUSO_BOT_HORAS = float(os.getenv("FUSO_HORARIO", "-3"))
 PASTA_BACKUP_UPDATE = os.path.join(BASE_DIR, "backup_update")
 
 # --- AUTO-ATUALIZACAO PELO GITHUB ---
@@ -261,6 +267,7 @@ def ficha_ja_esta_pendente(pendentes, canal_id, msg_id):
 # descartar. E o que garante que, na abertura do servidor, ninguem fique de fora
 # mesmo que o bot caia antes, durante ou depois.
 
+ESTADO_AGUARDANDO_ABERTURA = "aguardando_abertura"
 ESTADO_AGUARDANDO_SERVIDOR = "aguardando_servidor"
 ESTADO_NA_FILA = "na_fila"
 ESTADO_REGISTRANDO = "registrando"
@@ -545,7 +552,93 @@ def texto_vidas_restantes(vidas):
     plural = "vida" if vidas["restantes"] == 1 else "vidas"
     return f"❤ Você ainda tem **{vidas['restantes']} {plural}** (personagens que ainda pode criar depois deste)."
 
-# --- AUTO-ATUALIZACAO ---
+# --- AGENDAMENTO DA ABERTURA DOS REGISTROS ---
+# Permite abrir os tickets antes do servidor existir: as fichas entram na fila
+# duravel e so sao aprovadas na data/hora marcada.
+
+def carregar_config_abertura():
+    config = carregar_json_seguro(ARQUIVO_CONFIG_ABERTURA, {})
+    return config if isinstance(config, dict) else {}
+
+def salvar_config_abertura(dados):
+    salvar_json_seguro(ARQUIVO_CONFIG_ABERTURA, dados, ensure_ascii=False)
+
+def agora_local():
+    """Horario 'de Brasilia' (ou o fuso configurado), independente do relogio da host."""
+    return datetime.now(timezone.utc) + timedelta(hours=FUSO_BOT_HORAS)
+
+def epoch_de_horario_local(momento_local):
+    """Converte um horario digitado pela staff (no fuso configurado) em epoch UTC."""
+    return (momento_local.replace(tzinfo=timezone.utc) - timedelta(hours=FUSO_BOT_HORAS)).timestamp()
+
+def timestamp_abertura_registros():
+    """Epoch em que a aprovacao comeca, ou None se nao houver agendamento."""
+    valor = carregar_config_abertura().get("abertura_epoch")
+    try:
+        return float(valor) if valor else None
+    except Exception:
+        return None
+
+def registros_estao_liberados():
+    momento = timestamp_abertura_registros()
+    return momento is None or time.time() >= momento
+
+def segundos_ate_abertura():
+    momento = timestamp_abertura_registros()
+    return 0 if momento is None else max(0, int(momento - time.time()))
+
+def texto_abertura_discord(prefixo="A aprovação começa"):
+    """Usa timestamp do Discord: cada pessoa ve no proprio fuso, sem confusao."""
+    momento = timestamp_abertura_registros()
+    if momento is None:
+        return ""
+    marca = int(momento)
+    if time.time() >= momento:
+        return "✅ **Os registros já estão abertos.**"
+    return f"🗓 **{prefixo} <t:{marca}:F>** (<t:{marca}:R>)."
+
+def interpretar_data_hora(texto_data, texto_hora):
+    """Aceita data em 07/08/2026, 07-08-2026, 2026-08-07 ou 07/08,
+    e hora em 20:00, 20h, 20h30, 20.
+    Devolve (datetime_local_naive, erro)."""
+    texto_hora = (texto_hora or "").strip().lower().replace("h", ":").strip(":")
+    if not texto_hora:
+        return None, "Informe a **hora** (ex: `20:00`)."
+
+    partes = [p for p in re.split(r"[:\s.]+", texto_hora) if p]
+    try:
+        hora = int(partes[0])
+        minuto = int(partes[1]) if len(partes) > 1 else 0
+    except Exception:
+        return None, f"Não entendi a hora `{texto_hora}`. Use algo como `20:00`."
+    if not (0 <= hora <= 23 and 0 <= minuto <= 59):
+        return None, "Hora inválida. Use de `00:00` até `23:59`."
+
+    referencia = agora_local().replace(tzinfo=None)
+    texto_data = (texto_data or "").strip()
+
+    if not texto_data:
+        alvo = referencia.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+        # Hora que ja passou hoje significa amanha.
+        if alvo <= referencia:
+            alvo += timedelta(days=1)
+        return alvo, None
+
+    numeros = [n for n in re.split(r"[/\-.\s]+", texto_data) if n.isdigit()]
+    if len(numeros) < 2:
+        return None, f"Não entendi a data `{texto_data}`. Use `DD/MM/AAAA`."
+
+    try:
+        if len(numeros[0]) == 4:                      # AAAA-MM-DD
+            ano, mes, dia = int(numeros[0]), int(numeros[1]), int(numeros[2])
+        else:                                          # DD/MM[/AAAA]
+            dia, mes = int(numeros[0]), int(numeros[1])
+            ano = int(numeros[2]) if len(numeros) > 2 else referencia.year
+            if ano < 100:
+                ano += 2000
+        return datetime(ano, mes, dia, hora, minuto), None
+    except ValueError as erro:
+        return None, f"Data inválida: {erro}."
 
 def carregar_versao_bot():
     return carregar_json_seguro(ARQUIVO_VERSAO_BOT, {}) or {}
@@ -1914,8 +2007,16 @@ async def enviar_painel_ficha(canal, membro):
         embed.set_footer(text="Staff: use /adicionar_vidas para liberar uma vida extra.")
         return await canal.send(embed=embed)
 
+    aviso_abertura = ""
+    if not registros_estao_liberados():
+        aviso_abertura = (
+            f"\n\n{texto_abertura_discord()}\n"
+            "Pode preencher sua ficha **agora mesmo** — ela fica guardada e seu personagem "
+            "é criado automaticamente na hora marcada."
+        )
+
     return await canal.send(
-        f"{situacao}\n\n"
+        f"{situacao}{aviso_abertura}\n\n"
         "📝 **Clique no botão abaixo para preencher sua ficha.**\n"
         "O formulário abre uma janela com os campos separados — assim não tem risco de errar o formato.\n"
         "*(Se preferir, você ainda pode digitar a ficha normalmente aqui no chat.)*",
@@ -2549,6 +2650,8 @@ async def loop_retentar_registros():
     Assim o registro nao depende de um unico gatilho ter funcionado."""
     if not servidor_online or fila_pendentes_em_espera:
         return
+    if not registros_estao_liberados():
+        return
 
     fila = carregar_fila_registro()
     if not fila:
@@ -2679,6 +2782,11 @@ async def processar_fichas_pendentes(espera_estabilizacao=True):
     if not fila:
         return
 
+    if not registros_estao_liberados():
+        restantes = segundos_ate_abertura()
+        print(f"[FICHAS] {len(fila)} ficha(s) guardada(s); aprovacao abre em {restantes // 60} min.")
+        return
+
     fila_pendentes_em_espera = True
     try:
         if espera_estabilizacao:
@@ -2723,7 +2831,10 @@ async def processar_fichas_pendentes(espera_estabilizacao=True):
 
                 msg = await reconstruir_ficha_salva(canal, p)
 
-                if p.get("estado") == ESTADO_AGUARDANDO_SERVIDOR:
+                if p.get("estado") == ESTADO_AGUARDANDO_ABERTURA:
+                    with suppress(Exception):
+                        await canal.send("🎉 **Chegou a hora!** Os registros abriram — estou criando seu personagem agora...")
+                elif p.get("estado") == ESTADO_AGUARDANDO_SERVIDOR:
                     with suppress(Exception):
                         await canal.send("🔄 **O servidor abriu!** Tirando sua ficha da fila de espera e registrando seu personagem agora...")
 
@@ -2796,6 +2907,23 @@ async def retomar_fichas_em_analise():
 
     if retomadas:
         print(f"[FICHAS] {retomadas} ficha(s) retomada(s) apos reinicio.")
+
+async def guardar_ficha_para_abertura(message):
+    """Ficha enviada antes da hora marcada: fica guardada em disco ate abrir."""
+    ja_estava = ficha_ja_esta_pendente(carregar_fila_registro(), message.channel.id, message.id)
+    registrar_na_fila(message, ESTADO_AGUARDANDO_ABERTURA)
+
+    if ja_estava:
+        return await message.channel.send(
+            f"⏳ **Sua ficha já está guardada.** {texto_abertura_discord()}\nNão precisa mandar de novo."
+        )
+
+    await message.channel.send(
+        f"✅ **Ficha recebida e guardada!**\n\n{texto_abertura_discord()}\n"
+        f"Seu personagem será criado automaticamente nesse horário — você **não precisa fazer mais nada** "
+        f"e nem mandar a ficha de novo.\n"
+        f"*A fila é gravada em disco: mesmo que o bot reinicie, sua ficha continua garantida.*"
+    )
 
 async def guardar_ficha_pendente(message):
     ja_estava = ficha_ja_esta_pendente(carregar_fila_registro(), message.channel.id, message.id)
@@ -3080,17 +3208,9 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
     # eu esqueca de marcar mantem a ficha guardada.
     manter_na_fila = True
     try:
-        if checar_online:
-            if not servidor_online:
-                await guardar_ficha_pendente(message)
-                return
-
-            resultado_online = await enviar_comando_rcon_detalhado("players")
-            if not resultado_online.ok:
-                servidor_online = False
-                await guardar_ficha_pendente(message)
-                return
-
+        # A leitura e a validacao de formato vem ANTES de qualquer espera. Assim,
+        # com o servidor fechado ou a abertura agendada, o jogador ja descobre na
+        # hora se errou o nome ou a senha, em vez de so no dia seguinte.
         nome_novo_raw, senha_raw = extrair_dados_ficha(message.content)
         profissao_raw = extrair_profissao_ficha(message.content)
         historia_raw = extrair_historia_ficha(message.content)
@@ -3109,6 +3229,27 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
         if not re.match(r'^[a-zA-Z0-9_ ]+$', nome_novo_limpo):
             manter_na_fila = False
             return await message.channel.send("❌ **REGISTRO CANCELADO:** O nome não pode conter caracteres especiais (aspas, símbolos, etc). Mande a ficha novamente.")
+
+        if not senha_ficha_valida(senha_raw):
+            manter_na_fila = False
+            return await message.channel.send("❌ **REGISTRO CANCELADO:** A senha não pode ter símbolos, espaços ou acentos. Use apenas letras e números. Mande a ficha novamente.")
+
+        # Portao do agendamento: a ficha entra na fila duravel e espera a hora
+        # marcada. Nada e perdido nem aprovado antes do tempo.
+        if not bypass and not registros_estao_liberados():
+            await guardar_ficha_para_abertura(message)
+            return
+
+        if checar_online:
+            if not servidor_online:
+                await guardar_ficha_pendente(message)
+                return
+
+            resultado_online = await enviar_comando_rcon_detalhado("players")
+            if not resultado_online.ok:
+                servidor_online = False
+                await guardar_ficha_pendente(message)
+                return
 
         db_personagens = carregar_personagens()
         user_id_str = str(message.author.id)
@@ -3974,6 +4115,88 @@ async def aprovar_ficha(interaction: discord.Interaction):
             return
 
     await interaction.followup.send("❌ Não encontrei nenhuma ficha de jogador nas últimas mensagens nem em análise neste ticket.")
+
+@bot.tree.command(name="agendar_abertura", description="🗓 Marca a data/hora em que a aprovação de personagens começa")
+@app_commands.describe(
+    hora="Hora de início, ex: 20:00 (horário de Brasília)",
+    data="Data, ex: 07/08/2026. Se não informar, usa hoje (ou amanhã se a hora já passou).",
+    cancelar="Libera os registros imediatamente e remove o agendamento.",
+)
+@app_commands.default_permissions(administrator=True)
+async def agendar_abertura(interaction: discord.Interaction, hora: str = None, data: str = None, cancelar: bool = False):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    fila = carregar_fila_registro()
+    aguardando = [p for p in fila if p.get("estado") == ESTADO_AGUARDANDO_ABERTURA]
+
+    if cancelar:
+        config = carregar_config_abertura()
+        tinha = config.get("abertura_epoch")
+        config.pop("abertura_epoch", None)
+        config["liberado_em"] = datetime.now().isoformat()
+        config["liberado_por"] = str(interaction.user)
+        salvar_config_abertura(config)
+
+        if not tinha:
+            return await interaction.response.send_message("ℹ Não havia agendamento — os registros já estavam abertos.", ephemeral=True)
+
+        await interaction.response.send_message(
+            f"🔓 **Registros liberados agora!**\n"
+            f"**{len(aguardando)}** ficha(s) que estavam guardadas vão começar a ser processadas em instantes."
+        )
+        # Sem os 5 minutos de estabilizacao: a liberacao foi manual e imediata.
+        bot.loop.create_task(processar_fichas_pendentes(espera_estabilizacao=False))
+        return
+
+    # Sem argumentos: mostra a situação atual.
+    if not hora and not data:
+        embed = discord.Embed(title="🗓 Abertura dos Registros", color=discord.Color.blurple())
+        momento = timestamp_abertura_registros()
+        if momento is None:
+            embed.color = discord.Color.green()
+            embed.description = "✅ **Os registros estão abertos.** As fichas são aprovadas assim que chegam."
+        else:
+            embed.description = texto_abertura_discord()
+            embed.add_field(name="Fichas guardadas esperando", value=f"**{len(aguardando)}**", inline=True)
+        embed.add_field(name="Total na fila", value=f"**{len(fila)}**", inline=True)
+        embed.set_footer(text="Use hora: e data: para agendar, ou cancelar:True para liberar já.")
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    momento_local, erro = interpretar_data_hora(data, hora)
+    if erro:
+        return await interaction.response.send_message(f"❌ {erro}", ephemeral=True)
+
+    epoch = epoch_de_horario_local(momento_local)
+    if epoch <= time.time():
+        return await interaction.response.send_message(
+            f"❌ Esse horário já passou (<t:{int(epoch)}:F>). Informe um momento no futuro.", ephemeral=True)
+
+    config = carregar_config_abertura()
+    config["abertura_epoch"] = epoch
+    config["agendado_em"] = datetime.now().isoformat()
+    config["agendado_por"] = str(interaction.user)
+    salvar_config_abertura(config)
+
+    marca = int(epoch)
+    embed = discord.Embed(
+        title="🗓 Abertura Agendada",
+        description=f"A aprovação de personagens começa <t:{marca}:F>\n(<t:{marca}:R>)",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Até lá",
+        value=(
+            "Os jogadores **podem abrir ticket e mandar a ficha normalmente**. "
+            "O bot valida nome e senha na hora e guarda tudo em disco.\n"
+            "Nenhum personagem é criado antes do horário marcado."
+        ),
+        inline=False,
+    )
+    if aguardando or fila:
+        embed.add_field(name="Já guardadas", value=f"**{len(aguardando)}** ficha(s) esperando a abertura", inline=True)
+    embed.set_footer(text=f"Agendado por {interaction.user.display_name} · horário de Brasília")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="versao_bot", description="ℹ Mostra a versão instalada e se existe atualização no GitHub")
 @app_commands.default_permissions(administrator=True)

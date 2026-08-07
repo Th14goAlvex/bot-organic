@@ -20,6 +20,7 @@ status_jogadores.json
 vips.json
 sorteios.json
 config_vidas.json
+config_abertura.json
 versao_bot.json
 
 # Backup automatico do /bot_atualizar

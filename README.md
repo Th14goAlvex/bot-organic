@@ -51,6 +51,7 @@ python bot.py
 
 | Comando | O que faz |
 |---|---|
+| `/agendar_abertura` | Marca a data/hora em que a aprovação de personagens começa |
 | `/bot_atualizar` | Baixa a última versão deste repositório e reinicia o bot |
 | `/versao_bot` | Mostra a versão instalada e se há atualização |
 | `/diagnostico_mortes` | Mostra qual arquivo de mortes o bot lê e como interpreta |
