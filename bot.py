@@ -2437,6 +2437,62 @@ async def encontrar_mensagem_status_existente(canal_status):
 
     return encontrada
 
+LIMITE_CANAIS_POR_CATEGORIA = 50   # limite rigido do Discord
+LIMITE_CANAIS_POR_SERVIDOR = 500   # limite rigido do Discord
+
+def categorias_da_familia(guild, nome_base):
+    """A categoria principal e as de transbordo ('NOME 2', 'NOME 3'...)."""
+    alvo = normalizar_chave_personagem(nome_base)
+    familia = []
+    for categoria in guild.categories:
+        nome = normalizar_chave_personagem(categoria.name)
+        if nome == alvo or re.fullmatch(rf"{re.escape(alvo)} \d+", nome or ""):
+            familia.append(categoria)
+    familia.sort(key=lambda c: len(c.name))
+    return familia
+
+def ticket_existente_do_jogador(guild, nome_base, nome_canal):
+    """Procura o ticket do jogador em TODAS as categorias da familia, nao so na
+    principal: com transbordo o ticket antigo pode estar numa das extras."""
+    for categoria in categorias_da_familia(guild, nome_base):
+        canal = discord.utils.get(categoria.text_channels, name=nome_canal)
+        if canal:
+            return canal
+    return None
+
+async def obter_categoria_com_espaco(guild, nome_base):
+    """O Discord permite no maximo 50 canais por categoria. Quando a categoria de
+    tickets enche, TODA criacao passa a falhar - e foi isso que derrubou a
+    abertura de tickets. Aqui achamos (ou criamos) uma categoria com espaco.
+
+    Devolve (categoria, erro_para_o_jogador)."""
+    familia = categorias_da_familia(guild, nome_base)
+
+    for categoria in familia:
+        if len(categoria.channels) < LIMITE_CANAIS_POR_CATEGORIA:
+            return categoria, None
+
+    if len(guild.channels) >= LIMITE_CANAIS_POR_SERVIDOR - 1:
+        return None, ("❌ O servidor atingiu o limite de canais do Discord "
+                      f"({LIMITE_CANAIS_POR_SERVIDOR}). A staff precisa apagar canais antigos.")
+
+    # Todas cheias: cria a proxima da familia.
+    proximo = len(familia) + 1 if familia else 1
+    nome_novo = nome_base if proximo == 1 else f"{nome_base} {proximo}"
+    try:
+        categoria = await guild.create_category(nome_novo)
+        if familia:
+            print(f"[TICKET] Categoria '{nome_base}' cheia ({LIMITE_CANAIS_POR_CATEGORIA} canais); "
+                  f"criada '{nome_novo}' para continuar aceitando tickets.")
+        else:
+            print(f"[TICKET] Categoria '{nome_novo}' nao existia; criada agora.")
+        return categoria, None
+    except discord.Forbidden:
+        return None, "❌ A categoria de tickets está cheia e não tenho permissão para criar outra. Avise a staff."
+    except discord.HTTPException as erro:
+        print(f"[TICKET] Falha ao criar categoria de transbordo: {erro}")
+        return None, "❌ A categoria de tickets está cheia e não consegui criar outra. Avise a staff."
+
 class TicketButton(discord.ui.View):
     def __init__(self, texto_botao="Abrir Ticket", emoji_botao="📩"):
         super().__init__(timeout=None)
@@ -2462,8 +2518,17 @@ class TicketButton(discord.ui.View):
         texto_msg = config["mensagem"]
 
         guild = interaction.guild
-        categoria = discord.utils.get(guild.categories, name=nome_categoria)
-        if not categoria: categoria = await guild.create_category(nome_categoria)
+        nome_canal = f"ticket-{interaction.user.name.lower()}"
+
+        # Ticket ja aberto (em qualquer categoria da familia).
+        canal_existente = ticket_existente_do_jogador(guild, nome_categoria, nome_canal)
+        if canal_existente:
+            return await interaction.followup.send(
+                f"Você já tem um ticket aberto: {canal_existente.mention}.", ephemeral=True)
+
+        categoria, erro_categoria = await obter_categoria_com_espaco(guild, nome_categoria)
+        if erro_categoria:
+            return await interaction.followup.send(erro_categoria, ephemeral=True)
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -2471,19 +2536,28 @@ class TicketButton(discord.ui.View):
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True)
         }
 
-        nome_canal = f"ticket-{interaction.user.name.lower()}"
-        
-        canal_existente = discord.utils.get(categoria.text_channels, name=nome_canal)
-        if canal_existente:
-            return await interaction.followup.send(f"Você já tem um ticket aberto nesta categoria: {canal_existente.mention}.", ephemeral=True)
-
         try:
             canal_ticket = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
         except discord.Forbidden:
-            return await interaction.followup.send("❌ Não tenho permissão para criar o canal do ticket. Avise a staff.", ephemeral=True)
+            return await interaction.followup.send(
+                "❌ Não tenho permissão para criar o canal do ticket. Avise a staff.", ephemeral=True)
         except discord.HTTPException as erro:
-            print(f"[TICKET] Falha ao criar canal para {interaction.user}: {erro}")
-            return await interaction.followup.send("❌ O Discord recusou a criação do ticket agora. Tente de novo em alguns segundos.", ephemeral=True)
+            # Ultima tentativa: se a categoria encheu entre a checagem e agora,
+            # abre uma nova de transbordo e tenta de novo.
+            print(f"[TICKET] Falha ao criar canal para {interaction.user} "
+                  f"(codigo {getattr(erro, 'code', '?')}): {erro}")
+            categoria, erro_categoria = await obter_categoria_com_espaco(guild, nome_categoria)
+            if erro_categoria:
+                return await interaction.followup.send(erro_categoria, ephemeral=True)
+            try:
+                canal_ticket = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
+            except discord.HTTPException as erro2:
+                print(f"[TICKET] Segunda tentativa falhou (codigo {getattr(erro2, 'code', '?')}): {erro2}")
+                return await interaction.followup.send(
+                    "❌ Não consegui abrir seu ticket agora.\n"
+                    f"*Detalhe para a staff: código `{getattr(erro2, 'code', '?')}` — {erro2}*",
+                    ephemeral=True,
+                )
 
         await interaction.followup.send(f"✅ Seu ticket foi aberto: {canal_ticket.mention}", ephemeral=True)
         await canal_ticket.send(f"👋 **Olá, {interaction.user.mention}!**\n\n{texto_msg}\n\n*(Staff: Use `/fechar_ticket`)*")
