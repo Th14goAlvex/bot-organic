@@ -84,7 +84,16 @@ TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "120"
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
 COOLDOWN_TENTATIVA_CALL_INGAME = max(20, int(os.getenv("COOLDOWN_TENTATIVA_CALL_INGAME", "60")))
 TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_INGAME", "60")))
-MENSAGEM_KICK_CALL_INGAME = 'entre em uma call do discord.'
+MENSAGEM_KICK_CALL_INGAME = os.getenv(
+    "MENSAGEM_KICK_CALL_INGAME",
+    "Voce foi desconectado por NAO estar na call IN-GAME do Discord. "
+    "Entre na call in-game e conecte novamente.",
+)
+# Cargos do jogo que nunca sao expulsos. Normalizados na hora do uso, porque
+# normalizar_chave_personagem so existe mais abaixo no arquivo.
+CARGOS_JOGO_ISENTOS_CALL_RAW = os.getenv(
+    "CARGOS_ISENTOS_CALL", "admin,moderator,moderador,overseer,gm,observer"
+)
 
 CHAVES_GEMINI = [os.getenv("GEMINI_API_KEY_1"), os.getenv("GEMINI_API_KEY_2"), os.getenv("GEMINI_API_KEY_3")]
 CHAVES_GEMINI = [chave for chave in CHAVES_GEMINI if chave]
@@ -1387,6 +1396,26 @@ def ler_jogadores_online_friendhost():
 
     return jogadores_online
 
+def canal_e_call_ingame(canal):
+    """A call obrigatoria e so a IN-GAME. 'OFF game', 'pos sessao' e qualquer
+    outra NAO valem - era exatamente por isso que ninguem era expulso."""
+    nome = normalizar_chave_personagem(getattr(canal, "name", ""))
+    alvo = normalizar_chave_personagem(NOME_CALL_INGAME)
+    if not alvo:
+        return False
+    # Aceita "in-game", "in-game 2", "🎮 in-game" etc, mas nunca "off game".
+    return alvo in nome
+
+def ids_na_call_ingame():
+    """IDs do Discord que estao na call IN-GAME (a unica que conta)."""
+    ids = set()
+    for guild in bot.guilds:
+        for canal in list(guild.voice_channels) + list(guild.stage_channels):
+            if not canal_e_call_ingame(canal):
+                continue
+            ids.update(membro.id for membro in canal.members if not membro.bot)
+    return ids
+
 def ids_em_qualquer_call_servidor():
     ids = set()
 
@@ -1395,6 +1424,27 @@ def ids_em_qualquer_call_servidor():
             ids.update(membro.id for membro in canal.members if not membro.bot)
 
     return ids
+
+def jogador_isento_call_ingame(user_id_str, dados):
+    """Quem NAO pode ser expulso: admin/moderador do jogo ou staff do Discord.
+
+    Antes a regra era 'so expulsa se role_id == 2'. Isso significava que qualquer
+    jogador sem role identificada (whitelist do jogo ilegivel, caminho errado
+    depois da troca de host) ficava imune - e ninguem era expulso."""
+    role_name = normalizar_chave_personagem(dados.get("role_name") or "")
+    isentos = [
+        normalizar_chave_personagem(c)
+        for c in CARGOS_JOGO_ISENTOS_CALL_RAW.split(",") if c.strip()
+    ]
+    if role_name and any(cargo and cargo in role_name for cargo in isentos):
+        return True, f"cargo no jogo ({role_name})"
+
+    for guild in bot.guilds:
+        membro = guild.get_member(int(user_id_str)) if user_id_str else None
+        if membro and usuario_e_staff(membro):
+            return True, "staff do Discord"
+
+    return False, ""
 
 def classificar_resposta_rcon_kick(resposta):
     texto = (resposta or "").lower().strip()
@@ -1411,6 +1461,36 @@ def classificar_resposta_rcon_kick(resposta):
         return "erro"
 
     return "ok"
+
+async def avisar_jogador_expulso_call(user_id_str, nome_personagem):
+    """Avisa no Discord, alem da mensagem que o jogo ja mostra na tela do kick."""
+    membro = None
+    for guild in bot.guilds:
+        with suppress(Exception):
+            membro = guild.get_member(int(user_id_str))
+        if membro:
+            break
+    if not membro:
+        return
+
+    texto = (
+        f"🔇 **Você foi desconectado do servidor.**\n\n"
+        f"Personagem: **{nome_personagem}**\n"
+        f"Motivo: você estava jogando **sem estar na call `{NOME_CALL_INGAME}`** do Discord.\n\n"
+        f"Entrar em outra call (OFF game, pós-sessão, etc.) **não conta** — precisa ser a call in-game.\n"
+        f"Entre nela e pode conectar de novo no servidor."
+    )
+
+    with suppress(Exception):
+        await membro.send(texto)
+        return
+
+    # DM bloqueada: avisa no canal de status, se existir.
+    if CANAL_STATUS_ID:
+        with suppress(Exception):
+            canal = bot.get_channel(int(CANAL_STATUS_ID))
+            if canal:
+                await canal.send(f"{membro.mention} {texto}", delete_after=120)
 
 async def expulsar_jogador_sem_call_ingame(nome_personagem):
     comandos = [
@@ -3497,7 +3577,7 @@ async def monitorar_call_ingame():
                 continue
 
             jogadores_online = ler_jogadores_online_friendhost()
-            ids_em_call = ids_em_qualquer_call_servidor()
+            ids_em_call = ids_na_call_ingame()
 
             for user_id_str, dados in jogadores_online.items():
                 personagem = dados.get("personagem")
@@ -3506,9 +3586,11 @@ async def monitorar_call_ingame():
                 registro = controle_call_ingame.get(user_id_str)
                 esta_na_call = int(user_id_str) in ids_em_call
 
-                if role_id != 2:
+                isento, motivo_isencao = jogador_isento_call_ingame(user_id_str, dados)
+                if isento:
                     if registro:
                         controle_call_ingame.pop(user_id_str, None)
+                        print(f"[CALL IN-GAME] {personagem} isento ({motivo_isencao}); nao sera expulso.")
                     continue
 
                 if esta_na_call:
@@ -3523,7 +3605,7 @@ async def monitorar_call_ingame():
                         "ultimo_visto": agora,
                         "ultima_tentativa": 0.0,
                     }
-                    print(f"[CALL IN-GAME] {personagem} ({role_name or 'user'}) está online sem estar em nenhuma call. Aguardando {TEMPO_GRACA_CALL_INGAME}s.")
+                    print(f"[CALL IN-GAME] {personagem} ({role_name or 'user'}) está online fora da call {NOME_CALL_INGAME}. Aguardando {TEMPO_GRACA_CALL_INGAME}s antes de expulsar.")
                     continue
 
                 registro["personagem"] = personagem
@@ -3540,7 +3622,8 @@ async def monitorar_call_ingame():
 
                 if ok:
                     registro["fora_call_desde"] = agora
-                    print(f"[CALL IN-GAME] {personagem} foi expulso do servidor por ficar sem call no Discord. Detalhe: {detalhe}")
+                    print(f"[CALL IN-GAME] {personagem} foi expulso por nao estar na call {NOME_CALL_INGAME}. Detalhe: {detalhe}")
+                    await avisar_jogador_expulso_call(user_id_str, personagem)
                 else:
                     print(f"[CALL IN-GAME] Falha ao expulsar {personagem}: {detalhe}")
 
