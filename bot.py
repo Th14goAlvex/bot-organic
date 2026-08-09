@@ -2300,6 +2300,29 @@ class FecharTicketView(discord.ui.View):
     async def fechar_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await fechar_ticket_por_botao(interaction)
 
+PREFIXO_CANAL_TICKET = "ticket-"
+
+def canal_e_ticket(canal):
+    """Trava de seguranca do botao de fechar: ele e persistente e poderia ser
+    acionado numa mensagem antiga fora de um ticket. So apagamos canal cujo nome
+    segue o padrao dos tickets, ou que esteja numa categoria de ticket."""
+    nome = getattr(canal, "name", "") or ""
+    if nome.lower().startswith(PREFIXO_CANAL_TICKET):
+        return True
+
+    categoria = getattr(canal, "category", None)
+    if not categoria:
+        return False
+    if categoria_processa_ficha_pos_morte(categoria):
+        return True
+
+    categorias_paineis = {
+        normalizar_chave_personagem(cfg.get("categoria", ""))
+        for cfg in carregar_paineis().values()
+        if isinstance(cfg, dict)
+    }
+    return normalizar_chave_personagem(categoria.name) in categorias_paineis
+
 async def fechar_ticket_por_botao(interaction: discord.Interaction):
     """Fecha o ticket a pedido do jogador.
 
@@ -2312,8 +2335,9 @@ async def fechar_ticket_por_botao(interaction: discord.Interaction):
         return
 
     canal = interaction.channel
-    if not categoria_processa_ficha_pos_morte(getattr(canal, "category", None)):
-        return await interaction.followup.send("❌ Este botão só funciona em ticket de personagem.", ephemeral=True)
+    if not canal_e_ticket(canal):
+        return await interaction.followup.send(
+            "❌ Este botão só funciona dentro de um ticket.", ephemeral=True)
 
     with suppress(Exception):
         await cancelar_processamento_ficha(canal.id, None)
@@ -2704,9 +2728,16 @@ class TicketButton(discord.ui.View):
         await interaction.followup.send(f"✅ Seu ticket foi aberto: {canal_ticket.mention}", ephemeral=True)
         await canal_ticket.send(f"👋 **Olá, {interaction.user.mention}!**\n\n{texto_msg}\n\n*(Staff: Use `/fechar_ticket`)*")
 
-        if categoria_processa_ficha_pos_morte(categoria):
-            with suppress(Exception):
+        with suppress(Exception):
+            if categoria_processa_ficha_pos_morte(categoria):
+                # Ticket de personagem: o painel da ficha ja traz o botao de fechar.
                 await enviar_painel_ficha(canal_ticket, interaction.user)
+            else:
+                await canal_ticket.send(
+                    "🗑 **Terminou seu atendimento?** Use o botão abaixo para fechar este ticket.\n"
+                    "*Se ainda precisa de ajuda, é só continuar conversando aqui.*",
+                    view=FecharTicketView(),
+                )
 
 class ZomboidBot(commands.Bot):
     def __init__(self):
@@ -5211,6 +5242,23 @@ async def fila_registros(interaction: discord.Interaction):
         embed.add_field(name="Jogadores na fila", value="\n".join(linhas), inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="enviar_botao_fechar", description="🗑 Posta o botão de fechar ticket neste canal")
+@app_commands.default_permissions(administrator=True)
+async def enviar_botao_fechar(interaction: discord.Interaction):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    if not canal_e_ticket(interaction.channel):
+        return await interaction.response.send_message(
+            "❌ Este canal não parece um ticket. O botão só é enviado dentro de tickets.", ephemeral=True)
+
+    await interaction.response.send_message("✅ Botão enviado neste canal.", ephemeral=True)
+    await interaction.channel.send(
+        "🗑 **Terminou seu atendimento?** Use o botão abaixo para fechar este ticket.\n"
+        "*Se ainda precisa de ajuda, é só continuar conversando aqui.*",
+        view=FecharTicketView(),
+    )
 
 @bot.tree.command(name="enviar_formulario", description="📝 Envia o botão do formulário de ficha neste canal")
 @app_commands.describe(jogador="Dono do ticket (opcional). Usado para mostrar as vidas certas na mensagem.")

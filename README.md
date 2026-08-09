@@ -60,6 +60,7 @@ python bot.py
 | `/fila_registros` | Mostra as fichas na fila esperando o servidor abrir |
 | `/aprovar_ficha` | Força a aprovação da ficha do ticket, ignorando o anti-fraude |
 | `/historico_registro` | Consulta o último registro de personagem de um jogador |
+| `/enviar_botao_fechar` | Posta o botão de fechar ticket num ticket já aberto |
 | `/enviar_formulario` | Posta o botão do formulário de ficha no canal |
 | `/iniciar_reuniao` · `/encerrar_reuniao` | Grava a call e gera a ata |
 | `!deploy` | Sincroniza os slash commands |
