@@ -52,6 +52,7 @@ python bot.py
 | Comando | O que faz |
 |---|---|
 | `/tempo_fechar_ticket` | Define em quantos minutos o ticket some após o registro |
+| `/aprovacao_automatica` | Liga/desliga a criação automática de personagem (manual = só via /aprovar_ficha) |
 | `/agendar_abertura` | Marca a data/hora em que a aprovação de personagens começa |
 | `/bot_atualizar` | Baixa a última versão deste repositório e reinicia o bot |
 | `/versao_bot` | Mostra a versão instalada e se há atualização |

@@ -281,6 +281,7 @@ def ficha_ja_esta_pendente(pendentes, canal_id, msg_id):
 # mesmo que o bot caia antes, durante ou depois.
 
 ESTADO_AGUARDANDO_ABERTURA = "aguardando_abertura"
+ESTADO_AGUARDANDO_STAFF = "aguardando_staff"
 ESTADO_AGUARDANDO_SERVIDOR = "aguardando_servidor"
 ESTADO_NA_FILA = "na_fila"
 ESTADO_REGISTRANDO = "registrando"
@@ -623,6 +624,19 @@ def agora_local():
 def epoch_de_horario_local(momento_local):
     """Converte um horario digitado pela staff (no fuso configurado) em epoch UTC."""
     return (momento_local.replace(tzinfo=timezone.utc) - timedelta(hours=FUSO_BOT_HORAS)).timestamp()
+
+def aprovacao_automatica_ativa():
+    """Quando desligada, a ficha e recebida e guardada, mas so vira personagem
+    depois que a staff aprovar com /aprovar_ficha. Padrao: ligada."""
+    config = carregar_config_abertura()
+    return not bool(config.get("aprovacao_manual"))
+
+def definir_aprovacao_automatica(ativa, autor):
+    config = carregar_config_abertura()
+    config["aprovacao_manual"] = not ativa
+    config["aprovacao_alterada_em"] = datetime.now().isoformat()
+    config["aprovacao_alterada_por"] = str(autor)
+    salvar_config_abertura(config)
 
 def timestamp_abertura_registros():
     """Epoch em que a aprovacao comeca, ou None se nao houver agendamento."""
@@ -3114,7 +3128,7 @@ async def loop_retentar_registros():
     Assim o registro nao depende de um unico gatilho ter funcionado."""
     if not servidor_online or fila_pendentes_em_espera:
         return
-    if not registros_estao_liberados():
+    if not aprovacao_automatica_ativa() or not registros_estao_liberados():
         return
 
     fila = carregar_fila_registro()
@@ -3246,6 +3260,10 @@ async def processar_fichas_pendentes(espera_estabilizacao=True):
     if not fila:
         return
 
+    if not aprovacao_automatica_ativa():
+        print(f"[FICHAS] Aprovacao automatica DESLIGADA; {len(fila)} ficha(s) aguardando a staff.")
+        return
+
     if not registros_estao_liberados():
         restantes = segundos_ate_abertura()
         print(f"[FICHAS] {len(fila)} ficha(s) guardada(s); aprovacao abre em {restantes // 60} min.")
@@ -3299,7 +3317,10 @@ async def processar_fichas_pendentes(espera_estabilizacao=True):
 
                 msg = await reconstruir_ficha_salva(canal, p)
 
-                if p.get("estado") == ESTADO_AGUARDANDO_ABERTURA:
+                if p.get("estado") == ESTADO_AGUARDANDO_STAFF:
+                    with suppress(Exception):
+                        await canal.send("✅ **Sua ficha foi liberada!** Criando seu personagem agora...")
+                elif p.get("estado") == ESTADO_AGUARDANDO_ABERTURA:
                     with suppress(Exception):
                         await canal.send("🎉 **Chegou a hora!** Os registros abriram — estou criando seu personagem agora...")
                 elif p.get("estado") == ESTADO_AGUARDANDO_SERVIDOR:
@@ -3375,6 +3396,25 @@ async def retomar_fichas_em_analise():
 
     if retomadas:
         print(f"[FICHAS] {retomadas} ficha(s) retomada(s) apos reinicio.")
+
+async def guardar_ficha_para_staff(message):
+    """Ficha recebida com a aprovacao automatica desligada: fica guardada ate a
+    staff aprovar manualmente."""
+    ja_estava = ficha_ja_esta_pendente(carregar_fila_registro(), message.channel.id, message.id)
+    registrar_na_fila(message, ESTADO_AGUARDANDO_STAFF)
+
+    if ja_estava:
+        return await message.channel.send(
+            "⏳ **Sua ficha já está guardada** e aguardando a análise da staff. Não precisa mandar de novo."
+        )
+
+    await message.channel.send(
+        "✅ **Ficha recebida!**\n\n"
+        "No momento os personagens estão sendo **aprovados manualmente pela staff**, "
+        "então o seu não é criado na hora.\n"
+        "Sua ficha está **guardada em disco** — aguarde aqui neste ticket que a staff analisa e libera.\n"
+        "*Você não precisa fazer mais nada nem reenviar a ficha.*"
+    )
 
 async def guardar_ficha_para_abertura(message):
     """Ficha enviada antes da hora marcada: fica guardada em disco ate abrir."""
@@ -3716,7 +3756,12 @@ async def processar_registro_pos_morte(message: discord.Message, bypass=False, c
                 "Se errou algum dado, use o botão **🗑 Fechar Ticket** e abra um novo. Isso **não gasta vida**."
             )
 
-        # Portao do agendamento: a ficha entra na fila duravel e espera a hora
+        # Portao 1: aprovacao automatica desligada -> so a staff libera.
+        if not bypass and not aprovacao_automatica_ativa():
+            await guardar_ficha_para_staff(message)
+            return
+
+        # Portao 2: agendamento. A ficha entra na fila duravel e espera a hora
         # marcada. Nada e perdido nem aprovado antes do tempo.
         if not bypass and not registros_estao_liberados():
             await guardar_ficha_para_abertura(message)
@@ -4607,7 +4652,9 @@ async def aprovar_ficha(interaction: discord.Interaction):
             await cancelar_processamento_ficha(entrada.get("canal_id"), entrada.get("msg_id"))
 
             estado = entrada.get("estado")
-            if estado == ESTADO_AGUARDANDO_ABERTURA:
+            if estado == ESTADO_AGUARDANDO_STAFF:
+                motivo = "estava aguardando aprovação manual da staff"
+            elif estado == ESTADO_AGUARDANDO_ABERTURA:
                 motivo = "estava guardada esperando o horário de abertura"
             elif estado == ESTADO_AGUARDANDO_SERVIDOR:
                 motivo = "estava na fila esperando o servidor"
@@ -4709,6 +4756,85 @@ async def tempo_fechar_ticket(interaction: discord.Interaction, minutos: int = N
         )
     embed.set_footer(text=f"Alterado por {interaction.user.display_name}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="aprovacao_automatica", description="🤖 Liga/desliga a aprovação automática de fichas de personagem")
+@app_commands.describe(
+    ativar="True = o bot cria o personagem sozinho. False = só a staff libera, com /aprovar_ficha.",
+)
+@app_commands.default_permissions(administrator=True)
+async def aprovacao_automatica(interaction: discord.Interaction, ativar: bool = None):
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    ativa_agora = aprovacao_automatica_ativa()
+    fila = carregar_fila_registro()
+    aguardando_staff = [p for p in fila if p.get("estado") == ESTADO_AGUARDANDO_STAFF]
+
+    # Sem argumento: mostra a situação.
+    if ativar is None:
+        embed = discord.Embed(title="🤖 Aprovação de Fichas", color=discord.Color.blurple())
+        if ativa_agora:
+            embed.color = discord.Color.green()
+            embed.description = (
+                "✅ **Automática (ligada).**\n"
+                "O bot analisa e cria o personagem sozinho assim que a ficha chega."
+            )
+        else:
+            embed.color = discord.Color.orange()
+            embed.description = (
+                "🙋 **Manual (desligada).**\n"
+                "As fichas são recebidas e guardadas, mas só viram personagem quando a staff usar `/aprovar_ficha` no ticket."
+            )
+        embed.add_field(name="Esperando a staff", value=f"**{len(aguardando_staff)}** ficha(s)", inline=True)
+        embed.add_field(name="Total na fila", value=f"**{len(fila)}**", inline=True)
+        embed.set_footer(text="Use ativar:True ou ativar:False para mudar.")
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    if ativar == ativa_agora:
+        estado = "ligada" if ativa_agora else "desligada"
+        return await interaction.response.send_message(
+            f"ℹ A aprovação automática já está **{estado}**. Nada mudou.", ephemeral=True)
+
+    definir_aprovacao_automatica(ativar, interaction.user)
+
+    if ativar:
+        embed = discord.Embed(
+            title="✅ Aprovação Automática LIGADA",
+            description="O bot volta a analisar e criar os personagens sozinho.",
+            color=discord.Color.green(),
+        )
+        if aguardando_staff:
+            embed.add_field(
+                name="Fichas represadas",
+                value=f"**{len(aguardando_staff)}** ficha(s) que esperavam a staff vão ser processadas agora.",
+                inline=False,
+            )
+        if not registros_estao_liberados():
+            embed.add_field(
+                name="⚠ Atenção",
+                value=f"Ainda existe abertura agendada: {texto_abertura_discord()} Até lá nada é criado.",
+                inline=False,
+            )
+        await interaction.response.send_message(embed=embed)
+        bot.loop.create_task(processar_fichas_pendentes(espera_estabilizacao=False))
+        return
+
+    embed = discord.Embed(
+        title="🙋 Aprovação Automática DESLIGADA",
+        description=(
+            "As fichas continuam sendo **recebidas e guardadas em disco**, mas nenhum personagem "
+            "é criado sozinho.\n\n"
+            "Para liberar, entre no ticket e use **`/aprovar_ficha`**."
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="O que o jogador vê",
+        value="Ele recebe a confirmação de que a ficha foi recebida e que a staff vai analisar.",
+        inline=False,
+    )
+    embed.set_footer(text=f"Desligado por {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="agendar_abertura", description="🗓 Marca a data/hora em que a aprovação de personagens começa")
 @app_commands.describe(
@@ -5204,6 +5330,7 @@ async def fila_registros(interaction: discord.Interaction):
         return await interaction.response.send_message("✅ A fila está vazia — nenhuma ficha aguardando registro.", ephemeral=True)
 
     rotulos = {
+        ESTADO_AGUARDANDO_STAFF: "🙋 Aguardando aprovação da staff",
         ESTADO_AGUARDANDO_SERVIDOR: "⏳ Aguardando servidor",
         ESTADO_NA_FILA: "📤 Enviada para registro",
         ESTADO_REGISTRANDO: "⚡ Registrando agora",
