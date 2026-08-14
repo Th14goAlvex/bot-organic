@@ -57,10 +57,28 @@ MAX_MENSAGENS_MEMORIA_IA = max(3, int(os.getenv("MAX_MENSAGENS_MEMORIA_IA", "9")
 MAX_DURACAO_REUNIAO_SEGUNDOS = max(60, int(os.getenv("MAX_DURACAO_REUNIAO_SEGUNDOS", "900")))
 # =========================================================
 
-FRIENDHOST_CSV_BASE_PADRAO = "/var/lib/pterodactyl/volumes/87611b15-879c-4b7b-a2b5-bf2f5628344f/.cache/Lua/FriendHost_Data"
-FRIENDHOST_LOGS_BASE_PADRAO = "/var/lib/pterodactyl/volumes/87611b15-879c-4b7b-a2b5-bf2f5628344f/.cache/Logs"
-PZ_SAVE_BASE_PADRAO = "/var/lib/pterodactyl/volumes/87611b15-879c-4b7b-a2b5-bf2f5628344f/.cache/Saves/Multiplayer/OrganicRP"
-PZ_DB_BASE_PADRAO = "/var/lib/pterodactyl/volumes/87611b15-879c-4b7b-a2b5-bf2f5628344f/.cache/db"
+FRIENDHOST_CACHE_CONTAINER = "/home/container/.cache"
+FRIENDHOST_CACHE_VOLUME_LEGADO = "/var/lib/pterodactyl/volumes/87611b15-879c-4b7b-a2b5-bf2f5628344f/.cache"
+
+def escolher_cache_friendhost_padrao():
+    """Usa o caminho visivel pelo processo do bot.
+
+    No Pterodactyl/FriendHost o bot roda dentro do container e enxerga os
+    arquivos em /home/container/.cache. O caminho /var/lib/pterodactyl/... e
+    valido apenas para processos que rodam no host fisico, fora do container.
+    """
+    for caminho in (FRIENDHOST_CACHE_CONTAINER, FRIENDHOST_CACHE_VOLUME_LEGADO):
+        if os.path.isdir(caminho):
+            return caminho
+    # Se o cache ainda nao existe no boot, mantenha o caminho padrao do
+    # container: o mod o cria assim que o servidor inicia.
+    return FRIENDHOST_CACHE_CONTAINER
+
+PZ_CACHE_BASE_PADRAO = escolher_cache_friendhost_padrao()
+FRIENDHOST_CSV_BASE_PADRAO = os.path.join(PZ_CACHE_BASE_PADRAO, "Lua", "FriendHost_Data")
+FRIENDHOST_LOGS_BASE_PADRAO = os.path.join(PZ_CACHE_BASE_PADRAO, "Logs")
+PZ_SAVE_BASE_PADRAO = os.path.join(PZ_CACHE_BASE_PADRAO, "Saves", "Multiplayer", "OrganicRP")
+PZ_DB_BASE_PADRAO = os.path.join(PZ_CACHE_BASE_PADRAO, "db")
 CSV_BASE_PATH = os.getenv("CSV_BASE_PATH", FRIENDHOST_CSV_BASE_PADRAO)
 LOGS_PATH = os.getenv("LOGS_PATH", FRIENDHOST_LOGS_BASE_PADRAO)
 TXT_BASE_PATH = os.getenv("TXT_BASE_PATH", LOGS_PATH)
@@ -87,7 +105,13 @@ CANAL_MORTES_ID = os.getenv("CANAL_MORTES_ID")
 CANAL_EVENTOS_ID = os.getenv("CANAL_EVENTOS_ID")
 CANAL_VIDAS_ID = os.getenv("CANAL_VIDAS_ID")
 NOME_CALL_INGAME = os.getenv("NOME_CALL_INGAME", "in-game")
-TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "120")))
+# Alem da call in-game, estas sao calls oficiais que tambem mantem o jogador
+# regular. O nome da call in-game sempre entra na lista, mesmo se o .env mudar.
+CANAIS_CALL_PERMITIDAS_RAW = os.getenv(
+    "CANAIS_CALL_PERMITIDAS",
+    "Sala de espera,Atendimento 1,Atendimento 2,Atendimento 3,TRABALHANDO",
+)
+TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "30")))
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
 COOLDOWN_TENTATIVA_CALL_INGAME = max(20, int(os.getenv("COOLDOWN_TENTATIVA_CALL_INGAME", "60")))
 TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_INGAME", "60")))
@@ -97,8 +121,8 @@ TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_IN
 IDADE_MAXIMA_ARQUIVO_ONLINE = max(90, int(os.getenv("IDADE_MAXIMA_ARQUIVO_ONLINE", "180")))
 MENSAGEM_KICK_CALL_INGAME = os.getenv(
     "MENSAGEM_KICK_CALL_INGAME",
-    "Voce foi desconectado por NAO estar na call IN-GAME do Discord. "
-    "Entre na call in-game e conecte novamente.",
+    "Voce foi desconectado por NAO estar em uma call permitida do Discord. "
+    "Entre na call in-game, Sala de espera, Atendimento ou TRABALHANDO e conecte novamente.",
 )
 # Cargos do jogo que nunca sao expulsos. Normalizados na hora do uso, porque
 # normalizar_chave_personagem so existe mais abaixo no arquivo.
@@ -1443,18 +1467,30 @@ def ler_jogadores_online_friendhost():
 
     return jogadores_online
 
+def nomes_calls_permitidas():
+    nomes = [NOME_CALL_INGAME]
+    nomes.extend(CANAIS_CALL_PERMITIDAS_RAW.split(","))
+    return {
+        normalizar_chave_personagem(nome)
+        for nome in nomes
+        if normalizar_chave_personagem(nome)
+    }
+
 def canal_e_call_ingame(canal):
-    """A call obrigatoria e so a IN-GAME. 'OFF game', 'pos sessao' e qualquer
-    outra NAO valem - era exatamente por isso que ninguem era expulso."""
+    """Retorna se o canal e uma das calls oficiais que contam para a regra.
+
+    O Discord inclui emojis e separadores no nome visual dos canais. Por isso
+    o texto permitido pode estar dentro do nome, mas com borda de palavra para
+    que ``Atendimento 1`` nao aceite por engano ``Atendimento 10``.
+    """
     nome = normalizar_chave_personagem(getattr(canal, "name", ""))
-    alvo = normalizar_chave_personagem(NOME_CALL_INGAME)
-    if not alvo:
-        return False
-    # Aceita "in-game", "in-game 2", "🎮 in-game" etc, mas nunca "off game".
-    return alvo in nome
+    for alvo in nomes_calls_permitidas():
+        if re.search(r"(?<![a-z0-9])" + re.escape(alvo) + r"(?![a-z0-9])", nome):
+            return True
+    return False
 
 def ids_na_call_ingame():
-    """IDs do Discord que estao na call IN-GAME (a unica que conta)."""
+    """IDs nas calls oficiais: in-game, espera, atendimentos e trabalhando."""
     ids = set()
     for guild in bot.guilds:
         for canal in list(guild.voice_channels) + list(guild.stage_channels):
@@ -5957,5 +5993,79 @@ async def on_message(message):
 
             except Exception as e:
                 await message.channel.send(f"⚠ Erro no servidor central: {e}")
+
+@bot.tree.command(name="diagnostico_call_ingame", description="Mostra se o monitor de call esta lendo jogadores e calls corretamente")
+@app_commands.default_permissions(administrator=True)
+async def diagnostico_call_ingame(interaction: discord.Interaction):
+    """Diagnostico sem kick para confirmar a integracao na host."""
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    caminho_ativo = await asyncio.to_thread(caminho_players_online_ativo)
+    caminhos_encontrados = await asyncio.to_thread(caminhos_players_online_friendhost)
+    jogadores_online = await asyncio.to_thread(ler_jogadores_online_friendhost)
+
+    embed = discord.Embed(title="Diagnostico da Call Obrigatoria", color=discord.Color.blurple())
+    embed.add_field(name="Calls que contam", value="`" + "`, `".join(sorted(nomes_calls_permitidas())) + "`", inline=False)
+    embed.add_field(name="Tolerancia antes do kick", value=f"**{TEMPO_GRACA_CALL_INGAME} segundos**", inline=True)
+
+    calls_ativas = []
+    ids_nas_calls = ids_na_call_ingame()
+    for guild in bot.guilds:
+        for canal in list(guild.voice_channels) + list(guild.stage_channels):
+            if canal_e_call_ingame(canal):
+                calls_ativas.append(f"{canal.name}: {len(canal.members)} membro(s)")
+    embed.add_field(
+        name="Pessoas nas calls permitidas",
+        value=f"**{len(ids_nas_calls)}**\n" + ("\n".join(calls_ativas[:8]) or "Nenhuma call permitida encontrada."),
+        inline=False,
+    )
+
+    if not caminho_ativo:
+        embed.color = discord.Color.red()
+        encontrados = "\n".join(caminhos_encontrados[:5]) or "nenhum"
+        embed.add_field(
+            name="Arquivo online indisponivel ou antigo",
+            value=("O bot nao pode aplicar kick sem uma lista atual de jogadores.\n"
+                   f"Procurado: `{CAMINHO_PLAYERS_ONLINE}`\n"
+                   f"Encontrados: ```{encontrados}```")[:1000],
+            inline=False,
+        )
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        idade = max(0, int(time.time() - os.path.getmtime(caminho_ativo)))
+        with open(caminho_ativo, "r", encoding="utf-8", errors="replace") as arquivo:
+            usernames = [linha.strip() for linha in arquivo if linha.strip()]
+    except Exception as erro:
+        embed.color = discord.Color.red()
+        embed.add_field(name="Falha ao ler arquivo", value=f"`{erro}`", inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    embed.add_field(
+        name="Arquivo de jogadores online",
+        value=f"`{caminho_ativo}`\nAtualizado ha **{idade}s** · {len(usernames)} username(s)",
+        inline=False,
+    )
+    embed.add_field(name="Usernames exportados pelo mod", value="```" + ("\n".join(usernames[:12]) or "(ninguem online)") + "```", inline=False)
+    vinculados = [f"{dados.get('username_jogo') or '?'} -> {dados.get('personagem') or '?'}" for dados in jogadores_online.values()]
+    embed.add_field(
+        name="Jogadores que o bot conseguiu vincular ao Discord",
+        value=("```" + ("\n".join(vinculados[:12]) or "(nenhum)") + "```")[:1000],
+        inline=False,
+    )
+    if usernames and not jogadores_online:
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="Atencao: nenhum jogador foi vinculado",
+            value=("O arquivo existe, mas o bot nao conseguiu associar os usernames aos registros. "
+                   "Confira se `personagens.json` esta preservado e se os usernames do arquivo sao os mesmos logins criados pelo bot."),
+            inline=False,
+        )
+    elif jogadores_online:
+        embed.color = discord.Color.green()
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 bot.run(DISCORD_TOKEN)
