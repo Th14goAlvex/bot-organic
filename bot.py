@@ -1461,6 +1461,68 @@ def ler_jogadores_online_friendhost():
 
     return jogadores_online
 
+def conteudo_lista_jogadores_rcon(resposta):
+    """Normaliza a saida do comando RCON ``players`` para uma lista simples.
+
+    O console costuma prefixar cada jogador com numero, por exemplo
+    ``1. Adrian Cross``. O parser de registros trabalha apenas com o nome.
+    """
+    linhas = []
+    for linha in (resposta or "").splitlines():
+        linha = re.sub(r"^\s*\d+\s*[.)-]\s*", "", linha).strip()
+        if not linha:
+            continue
+        chave = normalizar_chave_personagem(linha)
+        if chave.startswith(("players connected", "players online", "online players", "there are no players")):
+            continue
+        linhas.append(linha)
+    return "\n".join(linhas)
+
+def identificar_jogadores_online_por_conteudo(conteudo, fonte):
+    """Vincula nomes vindos do RCON aos IDs do Discord registrados no bot."""
+    db_personagens, indice_norm, indice_compacto = construir_indices_personagens_atuais()
+    roles_norm, roles_compacto = carregar_roles_whitelist_jogo()
+    vinculos_norm, vinculos_compacto = carregar_vinculos_networkplayers_jogo(indice_norm, indice_compacto)
+    if not db_personagens:
+        return {}
+
+    jogadores_online = {}
+    for row in csv.reader((conteudo or "").splitlines(), delimiter=";"):
+        jogador = identificar_jogador_online_por_linha(
+            row,
+            db_personagens,
+            indice_norm,
+            indice_compacto,
+            vinculos_norm,
+            vinculos_compacto,
+            roles_norm,
+            roles_compacto,
+        )
+        if not jogador:
+            continue
+        jogadores_online[jogador["discord_id"]] = {
+            "personagem": jogador["personagem"],
+            "username_jogo": jogador.get("username_jogo"),
+            "role_id": jogador.get("role_id"),
+            "role_name": jogador.get("role_name"),
+            "fonte": fonte,
+        }
+    return jogadores_online
+
+async def ler_jogadores_online_monitoramento():
+    """Le o TXT dos mods; sem volume compartilhado, usa RCON como fallback."""
+    caminho = await asyncio.to_thread(caminho_players_online_ativo)
+    if caminho:
+        return await asyncio.to_thread(ler_jogadores_online_friendhost)
+
+    resultado = await enviar_comando_rcon_detalhado("players")
+    if not resultado.ok:
+        print(f"[CALL IN-GAME] Nao achei online_players.txt e o RCON players falhou: {resultado.error}")
+        return {}
+
+    conteudo = conteudo_lista_jogadores_rcon(resultado.output)
+    return identificar_jogadores_online_por_conteudo(conteudo, "RCON players")
+
 def nomes_calls_permitidas():
     nomes = [NOME_CALL_INGAME]
     nomes.extend(CANAIS_CALL_PERMITIDAS_RAW.split(","))
@@ -3720,7 +3782,7 @@ async def monitorar_call_ingame():
                 await asyncio.sleep(INTERVALO_MONITOR_CALL_INGAME)
                 continue
 
-            jogadores_online = ler_jogadores_online_friendhost()
+            jogadores_online = await ler_jogadores_online_monitoramento()
             ids_em_call = ids_na_call_ingame()
 
             for user_id_str, dados in jogadores_online.items():
@@ -5998,7 +6060,7 @@ async def diagnostico_call_ingame(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     caminho_ativo = await asyncio.to_thread(caminho_players_online_ativo)
     caminhos_encontrados = await asyncio.to_thread(caminhos_players_online_friendhost)
-    jogadores_online = await asyncio.to_thread(ler_jogadores_online_friendhost)
+    jogadores_online = await ler_jogadores_online_monitoramento()
 
     embed = discord.Embed(title="Diagnostico da Call Obrigatoria", color=discord.Color.blurple())
     embed.add_field(name="Calls que contam", value="`" + "`, `".join(sorted(nomes_calls_permitidas())) + "`", inline=False)
@@ -6017,6 +6079,22 @@ async def diagnostico_call_ingame(interaction: discord.Interaction):
     )
 
     if not caminho_ativo:
+        if jogadores_online:
+            embed.color = discord.Color.green()
+            vinculados_rcon = [
+                f"{dados.get('username_jogo') or '?'} -> {dados.get('personagem') or '?'}"
+                for dados in jogadores_online.values()
+            ]
+            embed.add_field(
+                name="Lista online via RCON",
+                value=(
+                    "O TXT do mod nao esta montado para o bot, mas o RCON respondeu e sera usado como fallback.\n"
+                    "```" + "\n".join(vinculados_rcon[:12]) + "```"
+                )[:1000],
+                inline=False,
+            )
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
         embed.color = discord.Color.red()
         encontrados = "\n".join(caminhos_encontrados[:5]) or "nenhum"
         embed.add_field(
