@@ -115,10 +115,6 @@ TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "30")
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
 COOLDOWN_TENTATIVA_CALL_INGAME = max(20, int(os.getenv("COOLDOWN_TENTATIVA_CALL_INGAME", "60")))
 TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_INGAME", "60")))
-# O mod atualizado regrava a lista a cada minuto. Nunca aplicamos kick a
-# partir de uma lista velha: se o mod travar, a ausencia de dados deve parar
-# a fiscalizacao, e nao expulsar quem talvez ja tenha saído do servidor.
-IDADE_MAXIMA_ARQUIVO_ONLINE = max(90, int(os.getenv("IDADE_MAXIMA_ARQUIVO_ONLINE", "180")))
 MENSAGEM_KICK_CALL_INGAME = os.getenv(
     "MENSAGEM_KICK_CALL_INGAME",
     "Voce foi desconectado por NAO estar em uma call permitida do Discord. "
@@ -1170,25 +1166,23 @@ def caminhos_players_online_friendhost():
     return localizar_arquivos_mod(CAMINHO_PLAYERS_ONLINE, NOMES_ARQUIVO_ONLINE)
 
 def caminho_players_online_ativo():
-    """Devolve somente a lista online mais recente e ainda atualizada.
+    """Devolve a lista online mais recente exportada pelos mods.
 
-    A versao B42.20 do mod sobrescreve ``online_players.txt`` a cada minuto.
-    Nao misturamos esse arquivo com sobras de CSVs antigos, pois uma lista
-    antiga poderia fazer o bot expulsar alguem que ja nao esta conectado.
+    O ZomboidOSOnlinePlayersCSV so regrava online_players.txt quando alguem
+    entra ou sai. Portanto, a data de modificacao nao mede se a lista e valida;
+    a lista em si e o estado atual exportado pelo mod.
     """
     caminhos = caminhos_players_online_friendhost()
     if not caminhos:
         return None
 
-    caminho = caminhos[0]
-    try:
-        idade = max(0.0, time.time() - os.path.getmtime(caminho))
-    except OSError:
-        return None
-
-    if idade > IDADE_MAXIMA_ARQUIVO_ONLINE:
-        return None
-    return caminho
+    # Este TXT e atualizado pelo mod dedicado no login/logout e e a fonte
+    # correta para a regra de 30 segundos. O CSV do FriendHost fica como
+    # fallback, pois a configuracao padrao dele pode salvar so a cada 10 min.
+    for caminho in caminhos:
+        if os.path.basename(caminho).lower() == "online_players.txt":
+            return caminho
+    return caminhos[0]
 
 def limpar_campo_csv(valor):
     return str(valor or "").replace('"', '').strip()
