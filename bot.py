@@ -1469,7 +1469,9 @@ def conteudo_lista_jogadores_rcon(resposta):
     """
     linhas = []
     for linha in (resposta or "").splitlines():
-        linha = re.sub(r"^\s*\d+\s*[.)-]\s*", "", linha).strip()
+        # O RCON pode listar como "1. Nome", "2) Nome" ou "-Nome".
+        # Todos esses prefixos precisam sair antes de comparar com o registro.
+        linha = re.sub(r"^\s*(?:\d+\s*[.)-]\s*|[-•]\s*)", "", linha).strip()
         if not linha:
             continue
         chave = normalizar_chave_personagem(linha)
@@ -1660,7 +1662,11 @@ async def expulsar_jogador_sem_call_ingame(username_jogo, nome_personagem=""):
             return True, resultado.output or "kick enviado com sucesso"
 
         if classificacao == "usuario_nao_encontrado":
-            return True, resultado.output or "jogador não encontrado no momento do kick"
+            # Pode ter desconectado entre a leitura e o kick, ou o primeiro
+            # comando pode nao aceitar esse formato de nome. Tenta o proximo
+            # comando e nunca avisa o Discord como se o kick tivesse ocorrido.
+            ultimo_erro = resultado.output or "jogador nao encontrado no momento do kick"
+            continue
 
         if classificacao == "comando_invalido":
             ultimo_erro = resultado.output or "comando de kick inválido"
@@ -6089,6 +6095,7 @@ async def diagnostico_call_ingame(interaction: discord.Interaction):
                 name="Lista online via RCON",
                 value=(
                     "O TXT do mod nao esta montado para o bot, mas o RCON respondeu e sera usado como fallback.\n"
+                    f"**{len(vinculados_rcon)}** jogador(es) vinculados; mostrando os primeiros 12.\n"
                     "```" + "\n".join(vinculados_rcon[:12]) + "```"
                 )[:1000],
                 inline=False,
