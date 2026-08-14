@@ -71,11 +71,18 @@ WHITELIST_DB_PATH = os.getenv("WHITELIST_DB_PATH", os.path.join(PZ_DB_BASE_PADRA
 # Os nomes legados ficam como fallback para servidor que ainda use o mod antigo.
 CAMINHO_MORTES = os.getenv("CAMINHO_MOD_MORTES", os.path.join(CSV_BASE_PATH, "Servidor", "deaths.csv.txt"))
 CAMINHO_EVENTOS = os.getenv("CAMINHO_MOD_EVENTOS", os.path.join(CSV_BASE_PATH, "Servidor", "event_history.csv.txt"))
-CAMINHO_PLAYERS_ONLINE = os.getenv("CAMINHO_MOD_PLAYERS_ONLINE", os.path.join(CSV_BASE_PATH, "Servidor", "players_online.csv.txt"))
+CAMINHO_PLAYERS_ONLINE = os.getenv("CAMINHO_MOD_PLAYERS_ONLINE", os.path.join(CSV_BASE_PATH, "Servidor", "online_players.txt"))
 
 NOMES_ARQUIVO_MORTES = ("deaths.csv.txt", "deaths.csv")
 NOMES_ARQUIVO_EVENTOS = ("event_history.csv.txt", "event_history.csv")
-NOMES_ARQUIVO_ONLINE = ("players_online.csv.txt", "players_online.csv", "online_players.csv.txt", "online_players.csv")
+# ZomboidOSOnlinePlayersCSV (B42.20) grava um username por linha em
+# online_players.txt. Os CSVs anteriores continuam como fallback para quem
+# ainda estiver no mod legado.
+NOMES_ARQUIVO_ONLINE = (
+    "online_players.txt",
+    "players_online.csv.txt", "players_online.csv",
+    "online_players.csv.txt", "online_players.csv",
+)
 CANAL_MORTES_ID = os.getenv("CANAL_MORTES_ID")
 CANAL_EVENTOS_ID = os.getenv("CANAL_EVENTOS_ID")
 CANAL_VIDAS_ID = os.getenv("CANAL_VIDAS_ID")
@@ -84,6 +91,10 @@ TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "120"
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
 COOLDOWN_TENTATIVA_CALL_INGAME = max(20, int(os.getenv("COOLDOWN_TENTATIVA_CALL_INGAME", "60")))
 TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_INGAME", "60")))
+# O mod atualizado regrava a lista a cada minuto. Nunca aplicamos kick a
+# partir de uma lista velha: se o mod travar, a ausencia de dados deve parar
+# a fiscalizacao, e nao expulsar quem talvez ja tenha saído do servidor.
+IDADE_MAXIMA_ARQUIVO_ONLINE = max(90, int(os.getenv("IDADE_MAXIMA_ARQUIVO_ONLINE", "180")))
 MENSAGEM_KICK_CALL_INGAME = os.getenv(
     "MENSAGEM_KICK_CALL_INGAME",
     "Voce foi desconectado por NAO estar na call IN-GAME do Discord. "
@@ -1134,6 +1145,27 @@ def localizar_arquivos_mod(caminho_configurado, nomes_aceitos):
 def caminhos_players_online_friendhost():
     return localizar_arquivos_mod(CAMINHO_PLAYERS_ONLINE, NOMES_ARQUIVO_ONLINE)
 
+def caminho_players_online_ativo():
+    """Devolve somente a lista online mais recente e ainda atualizada.
+
+    A versao B42.20 do mod sobrescreve ``online_players.txt`` a cada minuto.
+    Nao misturamos esse arquivo com sobras de CSVs antigos, pois uma lista
+    antiga poderia fazer o bot expulsar alguem que ja nao esta conectado.
+    """
+    caminhos = caminhos_players_online_friendhost()
+    if not caminhos:
+        return None
+
+    caminho = caminhos[0]
+    try:
+        idade = max(0.0, time.time() - os.path.getmtime(caminho))
+    except OSError:
+        return None
+
+    if idade > IDADE_MAXIMA_ARQUIVO_ONLINE:
+        return None
+    return caminho
+
 def limpar_campo_csv(valor):
     return str(valor or "").replace('"', '').strip()
 
@@ -1369,8 +1401,8 @@ def identificar_jogador_online_por_linha(campos, db_personagens, indice_norm, in
     return None
 
 def ler_jogadores_online_friendhost():
-    caminhos = caminhos_players_online_friendhost()
-    if not caminhos:
+    caminho = caminho_players_online_ativo()
+    if not caminho:
         return {}
 
     db_personagens, indice_norm, indice_compacto = construir_indices_personagens_atuais()
@@ -1381,32 +1413,33 @@ def ler_jogadores_online_friendhost():
 
     jogadores_online = {}
 
-    for caminho in caminhos:
-        try:
-            with open(caminho, "r", encoding="utf-8", errors="replace", newline="") as f:
-                leitor = csv.reader(f, delimiter=";")
-                for row in leitor:
-                    jogador = identificar_jogador_online_por_linha(
-                        row,
-                        db_personagens,
-                        indice_norm,
-                        indice_compacto,
-                        vinculos_norm,
-                        vinculos_compacto,
-                        roles_norm,
-                        roles_compacto,
-                    )
-                    if not jogador:
-                        continue
-                    jogadores_online[jogador["discord_id"]] = {
-                        "personagem": jogador["personagem"],
-                        "username_jogo": jogador.get("username_jogo"),
-                        "role_id": jogador.get("role_id"),
-                        "role_name": jogador.get("role_name"),
-                        "fonte": caminho,
-                    }
-        except Exception as erro:
-            print(f"[CALL IN-GAME] Falha ao ler jogadores online em {caminho}: {erro}")
+    try:
+        with open(caminho, "r", encoding="utf-8", errors="replace", newline="") as f:
+            # O formato novo tem um username por linha; csv.reader tambem
+            # interpreta corretamente os CSVs legados separados por ';'.
+            leitor = csv.reader(f, delimiter=";")
+            for row in leitor:
+                jogador = identificar_jogador_online_por_linha(
+                    row,
+                    db_personagens,
+                    indice_norm,
+                    indice_compacto,
+                    vinculos_norm,
+                    vinculos_compacto,
+                    roles_norm,
+                    roles_compacto,
+                )
+                if not jogador:
+                    continue
+                jogadores_online[jogador["discord_id"]] = {
+                    "personagem": jogador["personagem"],
+                    "username_jogo": jogador.get("username_jogo"),
+                    "role_id": jogador.get("role_id"),
+                    "role_name": jogador.get("role_name"),
+                    "fonte": caminho,
+                }
+    except Exception as erro:
+        print(f"[CALL IN-GAME] Falha ao ler jogadores online em {caminho}: {erro}")
 
     return jogadores_online
 
@@ -1506,10 +1539,20 @@ async def avisar_jogador_expulso_call(user_id_str, nome_personagem):
             if canal:
                 await canal.send(f"{membro.mention} {texto}", delete_after=120)
 
-async def expulsar_jogador_sem_call_ingame(nome_personagem):
+async def expulsar_jogador_sem_call_ingame(username_jogo, nome_personagem=""):
+    """Expulsa pelo username de login do PZ, nao pelo nome do personagem.
+
+    O mod ZomboidOSOnlinePlayersCSV atualizado exporta ``player:getUsername()``
+    e o comando RCON ``kickuser`` recebe exatamente esse identificador.
+    ``nome_personagem`` permanece apenas como fallback para os CSVs legados.
+    """
+    alvo = (username_jogo or nome_personagem or "").strip()
+    if not alvo:
+        return False, "arquivo online sem username e sem nome de personagem"
+
     comandos = [
-        f'kickuser "{nome_personagem}" -r "{MENSAGEM_KICK_CALL_INGAME}"',
-        f'kick "{nome_personagem}" -r "{MENSAGEM_KICK_CALL_INGAME}"',
+        f'kickuser "{alvo}" -r "{MENSAGEM_KICK_CALL_INGAME}"',
+        f'kick "{alvo}" -r "{MENSAGEM_KICK_CALL_INGAME}"',
     ]
 
     ultimo_erro = ""
@@ -3689,7 +3732,9 @@ async def monitorar_call_ingame():
                     continue
 
                 registro["ultima_tentativa"] = agora
-                ok, detalhe = await expulsar_jogador_sem_call_ingame(personagem)
+                ok, detalhe = await expulsar_jogador_sem_call_ingame(
+                    dados.get("username_jogo"), personagem
+                )
 
                 if ok:
                     registro["fora_call_desde"] = agora
