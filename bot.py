@@ -1332,6 +1332,38 @@ def identificar_role_jogo(campos_limpos, nome_personagem, username_jogo, roles_n
 
     return None
 
+def encontrar_membro_discord_por_nome_personagem(nome_personagem):
+    """Procura um membro pelo nome/apelido exibido no Discord.
+
+    E um fallback para personagens antigos ou criados fora do fluxo do bot,
+    que ainda nao aparecem em personagens.json. So aceita correspondencia
+    exata e unica para nunca associar o jogador errado.
+    """
+    chave_norm = normalizar_chave_personagem(nome_personagem)
+    chave_compacta = compactar_chave_personagem(nome_personagem)
+    if not chave_norm:
+        return None
+
+    encontrados = {}
+    for guild in bot.guilds:
+        for membro in guild.members:
+            candidatos = [
+                membro.display_name,
+                membro.name,
+                getattr(membro, "global_name", None),
+            ]
+            for candidato in candidatos:
+                if not candidato:
+                    continue
+                if (
+                    normalizar_chave_personagem(candidato) == chave_norm
+                    or compactar_chave_personagem(candidato) == chave_compacta
+                ):
+                    encontrados[membro.id] = membro
+                    break
+
+    return next(iter(encontrados.values())) if len(encontrados) == 1 else None
+
 def identificar_jogador_online_por_linha(campos, db_personagens, indice_norm, indice_compacto, vinculos_norm, vinculos_compacto, roles_norm, roles_compacto):
     candidatos = {}
     campos_limpos = [limpar_campo_csv(campo) for campo in campos if limpar_campo_csv(campo)]
@@ -1386,6 +1418,26 @@ def identificar_jogador_online_por_linha(campos, db_personagens, indice_norm, in
             "role_id": (role_info or {}).get("role_id"),
             "role_name": (role_info or {}).get("role_name"),
         }
+
+    # A lista online pode conter personagens antigos que nao foram criados
+    # pelo bot e por isso nao existem no banco local. No servidor, o apelido
+    # do Discord normalmente e o nome do personagem; use-o apenas se for uma
+    # correspondencia exata e sem ambiguidade.
+    if not candidatos and campos_limpos:
+        membro = encontrar_membro_discord_por_nome_personagem(campos_limpos[0])
+        if membro:
+            nome_personagem = campos_limpos[0]
+            role_info = identificar_role_jogo(
+                campos_limpos, nome_personagem, nome_personagem,
+                roles_norm, roles_compacto,
+            )
+            return {
+                "discord_id": str(membro.id),
+                "personagem": nome_personagem,
+                "username_jogo": (role_info or {}).get("username") or nome_personagem,
+                "role_id": (role_info or {}).get("role_id"),
+                "role_name": (role_info or {}).get("role_name"),
+            }
 
     if len(campos_limpos) <= 1:
         return None
