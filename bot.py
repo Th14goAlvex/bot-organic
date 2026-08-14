@@ -17,7 +17,6 @@ import socket
 import time
 import unicodedata
 import csv
-import io
 import random
 import sqlite3
 from array import array
@@ -91,17 +90,6 @@ WHITELIST_DB_PATH = os.getenv("WHITELIST_DB_PATH", os.path.join(PZ_DB_BASE_PADRA
 CAMINHO_MORTES = os.getenv("CAMINHO_MOD_MORTES", os.path.join(CSV_BASE_PATH, "Servidor", "deaths.csv.txt"))
 CAMINHO_EVENTOS = os.getenv("CAMINHO_MOD_EVENTOS", os.path.join(CSV_BASE_PATH, "Servidor", "event_history.csv.txt"))
 CAMINHO_PLAYERS_ONLINE = os.getenv("CAMINHO_MOD_PLAYERS_ONLINE", os.path.join(CSV_BASE_PATH, "Servidor", "online_players.txt"))
-
-# Quando o bot e o Project Zomboid estao em containers diferentes, o arquivo
-# do mod nao existe no filesystem do bot. Nessa situacao ele pode le-lo pela
-# API Client do Pterodactyl/FriendHost. A chave fica somente no .env da host.
-PTERODACTYL_PANEL_URL = os.getenv("PTERODACTYL_PANEL_URL", "https://friendhost-painel.ddnsfree.com").rstrip("/")
-PTERODACTYL_API_KEY = os.getenv("PTERODACTYL_API_KEY", "").strip()
-PTERODACTYL_SERVER_ID = os.getenv("PTERODACTYL_SERVER_ID", "02c418e5").strip()
-PTERODACTYL_ARQUIVO_ONLINE = os.getenv(
-    "PTERODACTYL_ARQUIVO_ONLINE",
-    "/.cache/Lua/FriendHost_Data/Servidor/online_players.txt",
-).strip()
 
 NOMES_ARQUIVO_MORTES = ("deaths.csv.txt", "deaths.csv")
 NOMES_ARQUIVO_EVENTOS = ("event_history.csv.txt", "event_history.csv")
@@ -1436,8 +1424,11 @@ def identificar_jogador_online_por_linha(campos, db_personagens, indice_norm, in
 
     return None
 
-def interpretar_jogadores_online(conteudo, fonte):
-    """Converte o TXT/CSV exportado pelo mod em jogadores vinculados ao Discord."""
+def ler_jogadores_online_friendhost():
+    caminho = caminho_players_online_ativo()
+    if not caminho:
+        return {}
+
     db_personagens, indice_norm, indice_compacto = construir_indices_personagens_atuais()
     roles_norm, roles_compacto = carregar_roles_whitelist_jogo()
     vinculos_norm, vinculos_compacto = carregar_vinculos_networkplayers_jogo(indice_norm, indice_compacto)
@@ -1446,78 +1437,35 @@ def interpretar_jogadores_online(conteudo, fonte):
 
     jogadores_online = {}
 
-    # O formato novo tem um username por linha; csv.reader tambem interpreta
-    # corretamente os CSVs legados separados por ';'.
-    leitor = csv.reader(io.StringIO(conteudo or ""), delimiter=";")
-    for row in leitor:
-        jogador = identificar_jogador_online_por_linha(
-            row,
-            db_personagens,
-            indice_norm,
-            indice_compacto,
-            vinculos_norm,
-            vinculos_compacto,
-            roles_norm,
-            roles_compacto,
-        )
-        if not jogador:
-            continue
-        jogadores_online[jogador["discord_id"]] = {
-            "personagem": jogador["personagem"],
-            "username_jogo": jogador.get("username_jogo"),
-            "role_id": jogador.get("role_id"),
-            "role_name": jogador.get("role_name"),
-            "fonte": fonte,
-        }
-
-    return jogadores_online
-
-def ler_jogadores_online_friendhost():
-    """Le a lista local quando bot e jogo compartilham o mesmo filesystem."""
-    caminho = caminho_players_online_ativo()
-    if not caminho:
-        return {}
-
     try:
-        with open(caminho, "r", encoding="utf-8", errors="replace", newline="") as arquivo:
-            return interpretar_jogadores_online(arquivo.read(), caminho)
+        with open(caminho, "r", encoding="utf-8", errors="replace", newline="") as f:
+            # O formato novo tem um username por linha; csv.reader tambem
+            # interpreta corretamente os CSVs legados separados por ';'.
+            leitor = csv.reader(f, delimiter=";")
+            for row in leitor:
+                jogador = identificar_jogador_online_por_linha(
+                    row,
+                    db_personagens,
+                    indice_norm,
+                    indice_compacto,
+                    vinculos_norm,
+                    vinculos_compacto,
+                    roles_norm,
+                    roles_compacto,
+                )
+                if not jogador:
+                    continue
+                jogadores_online[jogador["discord_id"]] = {
+                    "personagem": jogador["personagem"],
+                    "username_jogo": jogador.get("username_jogo"),
+                    "role_id": jogador.get("role_id"),
+                    "role_name": jogador.get("role_name"),
+                    "fonte": caminho,
+                }
     except Exception as erro:
         print(f"[CALL IN-GAME] Falha ao ler jogadores online em {caminho}: {erro}")
-        return {}
 
-async def baixar_lista_online_pterodactyl():
-    """Le o TXT do servidor pela API Client quando os containers sao separados."""
-    if not PTERODACTYL_API_KEY:
-        return None, "API do painel nao configurada"
-    if not PTERODACTYL_PANEL_URL or not PTERODACTYL_SERVER_ID or not PTERODACTYL_ARQUIVO_ONLINE:
-        return None, "configuracao da API do painel incompleta"
-
-    url = f"{PTERODACTYL_PANEL_URL}/api/client/servers/{PTERODACTYL_SERVER_ID}/files/contents"
-    cabecalhos = {
-        "Authorization": f"Bearer {PTERODACTYL_API_KEY}",
-        "Accept": "Application/vnd.pterodactyl.v1+json",
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as sessao:
-            async with sessao.get(url, headers=cabecalhos, params={"file": PTERODACTYL_ARQUIVO_ONLINE}) as resposta:
-                if resposta.status != 200:
-                    texto = (await resposta.text())[:180].replace("\n", " ")
-                    return None, f"API do painel respondeu HTTP {resposta.status}: {texto}"
-                return await resposta.text(), None
-    except Exception as erro:
-        return None, f"falha ao acessar API do painel: {erro}"
-
-async def ler_jogadores_online_monitoramento():
-    """Prioriza a API configurada e usa arquivo local como fallback seguro."""
-    conteudo, erro_api = await baixar_lista_online_pterodactyl()
-    if conteudo is not None:
-        return interpretar_jogadores_online(conteudo, "API do painel")
-
-    jogadores = await asyncio.to_thread(ler_jogadores_online_friendhost)
-    if not jogadores and erro_api and erro_api != "API do painel nao configurada":
-        print(f"[CALL IN-GAME] {erro_api}")
-    return jogadores
+    return jogadores_online
 
 def nomes_calls_permitidas():
     nomes = [NOME_CALL_INGAME]
@@ -3778,7 +3726,7 @@ async def monitorar_call_ingame():
                 await asyncio.sleep(INTERVALO_MONITOR_CALL_INGAME)
                 continue
 
-            jogadores_online = await ler_jogadores_online_monitoramento()
+            jogadores_online = ler_jogadores_online_friendhost()
             ids_em_call = ids_na_call_ingame()
 
             for user_id_str, dados in jogadores_online.items():
@@ -6054,13 +6002,9 @@ async def diagnostico_call_ingame(interaction: discord.Interaction):
         return
 
     await interaction.response.defer(ephemeral=True)
-    conteudo_api, erro_api = await baixar_lista_online_pterodactyl()
     caminho_ativo = await asyncio.to_thread(caminho_players_online_ativo)
     caminhos_encontrados = await asyncio.to_thread(caminhos_players_online_friendhost)
-    if conteudo_api is not None:
-        jogadores_online = interpretar_jogadores_online(conteudo_api, "API do painel")
-    else:
-        jogadores_online = await asyncio.to_thread(ler_jogadores_online_friendhost)
+    jogadores_online = await asyncio.to_thread(ler_jogadores_online_friendhost)
 
     embed = discord.Embed(title="Diagnostico da Call Obrigatoria", color=discord.Color.blurple())
     embed.add_field(name="Calls que contam", value="`" + "`, `".join(sorted(nomes_calls_permitidas())) + "`", inline=False)
@@ -6078,34 +6022,26 @@ async def diagnostico_call_ingame(interaction: discord.Interaction):
         inline=False,
     )
 
-    if conteudo_api is None and not caminho_ativo:
+    if not caminho_ativo:
         embed.color = discord.Color.red()
         encontrados = "\n".join(caminhos_encontrados[:5]) or "nenhum"
         embed.add_field(
             name="Arquivo online indisponivel ou antigo",
             value=("O bot nao pode aplicar kick sem uma lista atual de jogadores.\n"
-                   f"API: {erro_api}\n"
                    f"Procurado: `{CAMINHO_PLAYERS_ONLINE}`\n"
                    f"Encontrados: ```{encontrados}```")[:1000],
             inline=False,
         )
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
-    if conteudo_api is not None:
-        idade = 0
-        usernames = [linha.strip() for linha in conteudo_api.splitlines() if linha.strip()]
-        fonte_online = "API do painel FriendHost"
-        caminho_ativo = fonte_online
-    else:
-        try:
-            idade = max(0, int(time.time() - os.path.getmtime(caminho_ativo)))
-            with open(caminho_ativo, "r", encoding="utf-8", errors="replace") as arquivo:
-                usernames = [linha.strip() for linha in arquivo if linha.strip()]
-            fonte_online = caminho_ativo
-        except Exception as erro:
-            embed.color = discord.Color.red()
-            embed.add_field(name="Falha ao ler arquivo", value=f"`{erro}`", inline=False)
-            return await interaction.followup.send(embed=embed, ephemeral=True)
+    try:
+        idade = max(0, int(time.time() - os.path.getmtime(caminho_ativo)))
+        with open(caminho_ativo, "r", encoding="utf-8", errors="replace") as arquivo:
+            usernames = [linha.strip() for linha in arquivo if linha.strip()]
+    except Exception as erro:
+        embed.color = discord.Color.red()
+        embed.add_field(name="Falha ao ler arquivo", value=f"`{erro}`", inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
 
     embed.add_field(
         name="Arquivo de jogadores online",
