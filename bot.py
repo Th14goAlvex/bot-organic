@@ -115,6 +115,8 @@ TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "30")
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
 COOLDOWN_TENTATIVA_CALL_INGAME = max(20, int(os.getenv("COOLDOWN_TENTATIVA_CALL_INGAME", "60")))
 TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_INGAME", "60")))
+USUARIO_PROTEGIDO_CALL_ID = os.getenv("USUARIO_PROTEGIDO_CALL_ID", "500259309251198986").strip()
+ATRASO_RETORNO_CALL_PROTEGIDA = 5
 MENSAGEM_KICK_CALL_INGAME = os.getenv(
     "MENSAGEM_KICK_CALL_INGAME",
     "Voce foi desconectado por NAO estar em uma call permitida do Discord. "
@@ -194,6 +196,7 @@ tarefa_retomar_analises = None
 tarefa_fichas_pendentes = None
 varredura_fichas_executada = False
 controle_call_ingame = {}
+tarefas_retorno_call_protegida = {}
 tarefas_remocao_vip = {}
 tarefas_fichas = set()
 tarefas_fichas_por_chave = {}
@@ -5736,6 +5739,76 @@ async def on_ready():
                 except: pass
         del vips[chave]
     if remover_imediatamente: salvar_vips(vips)
+
+async def movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
+    """Confere o log de auditoria para distinguir arraste de mudanca voluntaria."""
+    limite = datetime.now(timezone.utc) - timedelta(seconds=12)
+    try:
+        async for entrada in guild.audit_logs(limit=8, action=discord.AuditLogAction.member_move):
+            alvo = getattr(entrada, "target", None)
+            if not alvo or getattr(alvo, "id", None) != membro_id:
+                continue
+            criado_em = getattr(entrada, "created_at", None)
+            if not criado_em or criado_em < limite:
+                continue
+            executor = getattr(entrada, "user", None)
+            if executor and executor.id not in {membro_id, getattr(bot.user, "id", None)}:
+                return True
+    except (discord.Forbidden, discord.HTTPException) as erro:
+        print(f"[CALL PROTEGIDA] Nao consegui ler o registro de auditoria: {erro}")
+    return False
+
+async def processar_retorno_call_protegida(guild_id, membro_id, canal_origem_id, canal_destino_id):
+    """Devolve o usuario protegido somente apos um arraste confirmado."""
+    try:
+        # O Discord pode levar um instante para gravar o movimento no audit log.
+        await asyncio.sleep(1)
+        guild = bot.get_guild(guild_id)
+        membro = guild.get_member(membro_id) if guild else None
+        if not guild or not membro:
+            return
+        if not await movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
+            return
+
+        await asyncio.sleep(ATRASO_RETORNO_CALL_PROTEGIDA)
+        membro = guild.get_member(membro_id)
+        canal_origem = guild.get_channel(canal_origem_id)
+        canal_atual = getattr(getattr(membro, "voice", None), "channel", None) if membro else None
+
+        # Se saiu ou mudou de call por vontade propria nesses 5 segundos,
+        # nao interferimos. So devolve se ainda estiver no destino do arraste.
+        if not membro or not canal_origem or not canal_atual or canal_atual.id != canal_destino_id:
+            return
+
+        await membro.move_to(canal_origem, reason="Protecao contra movimentacao de call nao autorizada")
+        print(f"[CALL PROTEGIDA] {membro} voltou para {canal_origem.name} apos ser movido por outra pessoa.")
+    except (discord.Forbidden, discord.HTTPException) as erro:
+        print(f"[CALL PROTEGIDA] Nao consegui devolver o usuario a call: {erro}")
+    except asyncio.CancelledError:
+        raise
+    finally:
+        tarefa_atual = asyncio.current_task()
+        if tarefas_retorno_call_protegida.get(membro_id) is tarefa_atual:
+            tarefas_retorno_call_protegida.pop(membro_id, None)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Protege exclusivamente o usuario configurado contra arraste entre calls."""
+    if str(member.id) != USUARIO_PROTEGIDO_CALL_ID:
+        return
+    if before.channel is None or after.channel is None or before.channel.id == after.channel.id:
+        return
+
+    tarefa_anterior = tarefas_retorno_call_protegida.pop(member.id, None)
+    if tarefa_anterior and not tarefa_anterior.done():
+        tarefa_anterior.cancel()
+
+    tarefa = bot.loop.create_task(
+        processar_retorno_call_protegida(
+            member.guild.id, member.id, before.channel.id, after.channel.id,
+        )
+    )
+    tarefas_retorno_call_protegida[member.id] = tarefa
 
 @bot.event
 async def on_message(message):
