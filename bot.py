@@ -115,7 +115,10 @@ TEMPO_GRACA_CALL_INGAME = max(30, int(os.getenv("TEMPO_GRACA_CALL_INGAME", "30")
 INTERVALO_MONITOR_CALL_INGAME = max(10, int(os.getenv("INTERVALO_MONITOR_CALL_INGAME", "20")))
 COOLDOWN_TENTATIVA_CALL_INGAME = max(20, int(os.getenv("COOLDOWN_TENTATIVA_CALL_INGAME", "60")))
 TOLERANCIA_SUMICO_CALL_INGAME = max(30, int(os.getenv("TOLERANCIA_SUMICO_CALL_INGAME", "60")))
-USUARIO_PROTEGIDO_CALL_ID = os.getenv("USUARIO_PROTEGIDO_CALL_ID", "500259309251198986").strip()
+# Um valor vazio no .env nao deve desligar sem querer a protecao do Thiago.
+USUARIO_PROTEGIDO_CALL_ID = (
+    os.getenv("USUARIO_PROTEGIDO_CALL_ID", "").strip() or "500259309251198986"
+)
 ATRASO_RETORNO_CALL_PROTEGIDA = 5
 MENSAGEM_KICK_CALL_INGAME = os.getenv(
     "MENSAGEM_KICK_CALL_INGAME",
@@ -5758,19 +5761,31 @@ async def movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
         print(f"[CALL PROTEGIDA] Nao consegui ler o registro de auditoria: {erro}")
     return False
 
+async def aguardar_confirmacao_movimento_externo(guild, membro_id, tentativas=4):
+    """O audit log pode aparecer alguns segundos depois do evento de voz."""
+    for tentativa in range(tentativas):
+        if await movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
+            return True
+        if tentativa + 1 < tentativas:
+            await asyncio.sleep(1)
+    return False
+
 async def processar_retorno_call_protegida(guild_id, membro_id, canal_origem_id, canal_destino_id):
     """Devolve o usuario protegido somente apos um arraste confirmado."""
     try:
-        # O Discord pode levar um instante para gravar o movimento no audit log.
-        await asyncio.sleep(1)
+        inicio = time.monotonic()
         guild = bot.get_guild(guild_id)
         membro = guild.get_member(membro_id) if guild else None
         if not guild or not membro:
             return
-        if not await movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
+        if not await aguardar_confirmacao_movimento_externo(guild, membro_id):
             return
 
-        await asyncio.sleep(ATRASO_RETORNO_CALL_PROTEGIDA)
+        # A espera total e de 5s desde o arraste. O tempo gasto esperando o
+        # audit log conta nessa janela, em vez de somar mais cinco segundos.
+        espera_restante = max(0, ATRASO_RETORNO_CALL_PROTEGIDA - (time.monotonic() - inicio))
+        if espera_restante:
+            await asyncio.sleep(espera_restante)
         membro = guild.get_member(membro_id)
         canal_origem = guild.get_channel(canal_origem_id)
         canal_atual = getattr(getattr(membro, "voice", None), "channel", None) if membro else None
@@ -6269,6 +6284,85 @@ async def diagnostico_call_ingame(interaction: discord.Interaction):
         )
     elif jogadores_online:
         embed.color = discord.Color.green()
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="diagnostico_protecao_call", description="Verifica a protecao contra arraste de call do Thiago")
+@app_commands.default_permissions(administrator=True)
+async def diagnostico_protecao_call(interaction: discord.Interaction):
+    """Mostra as permissoes e o ultimo arraste que o Discord registrou."""
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild or not bot.user:
+        return await interaction.followup.send("Este comando so funciona dentro de um servidor.", ephemeral=True)
+
+    membro_bot = guild.get_member(bot.user.id)
+    permissoes = getattr(membro_bot, "guild_permissions", None)
+    pode_ler_auditoria = bool(getattr(permissoes, "view_audit_log", False))
+    pode_mover = bool(getattr(permissoes, "move_members", False))
+    alvo_id = int(USUARIO_PROTEGIDO_CALL_ID) if USUARIO_PROTEGIDO_CALL_ID.isdigit() else None
+    alvo = guild.get_member(alvo_id) if alvo_id else None
+    call_atual = getattr(getattr(alvo, "voice", None), "channel", None)
+
+    embed = discord.Embed(title="Diagnostico da Protecao contra Arraste", color=discord.Color.green())
+    embed.add_field(
+        name="Usuario protegido",
+        value=(f"<@{USUARIO_PROTEGIDO_CALL_ID}> (`{USUARIO_PROTEGIDO_CALL_ID}`)"
+               if alvo_id else "ID configurado invalido"),
+        inline=False,
+    )
+    embed.add_field(
+        name="Permissoes do bot",
+        value=(f"Ver registro de auditoria: {'✅' if pode_ler_auditoria else '❌'}\n"
+               f"Mover membros: {'✅' if pode_mover else '❌'}"),
+        inline=True,
+    )
+    embed.add_field(
+        name="Call atual",
+        value=call_atual.mention if call_atual else "O usuario nao esta em call (ou nao esta no cache do servidor).",
+        inline=True,
+    )
+
+    if not pode_ler_auditoria or not pode_mover:
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="Acao necessaria",
+            value="Dê ao cargo do bot as permissoes **Ver registro de auditoria** e **Mover membros**. "
+                  "Sem o registro, o Discord nao permite diferenciar um arraste de uma troca voluntaria.",
+            inline=False,
+        )
+
+    ultimo_arraste = None
+    erro_auditoria = None
+    try:
+        async for entrada in guild.audit_logs(limit=12, action=discord.AuditLogAction.member_move):
+            if alvo_id and getattr(getattr(entrada, "target", None), "id", None) == alvo_id:
+                ultimo_arraste = entrada
+                break
+    except (discord.Forbidden, discord.HTTPException) as erro:
+        erro_auditoria = str(erro)
+
+    if ultimo_arraste:
+        executor = getattr(ultimo_arraste, "user", None)
+        criado_em = getattr(ultimo_arraste, "created_at", None)
+        quando = discord.utils.format_dt(criado_em, style="R") if criado_em else "horario indisponivel"
+        embed.add_field(
+            name="Ultimo arraste registrado",
+            value=f"Por {getattr(executor, 'mention', str(executor or 'desconhecido'))} · {quando}",
+            inline=False,
+        )
+    elif erro_auditoria:
+        embed.color = discord.Color.red()
+        embed.add_field(name="Registro de auditoria", value=f"Falha ao consultar: `{erro_auditoria[:700]}`", inline=False)
+    else:
+        embed.add_field(
+            name="Registro de auditoria",
+            value="Nenhum arraste recente desse usuario foi encontrado. Faca um teste: outra pessoa move voce entre duas calls.",
+            inline=False,
+        )
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
