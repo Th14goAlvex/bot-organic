@@ -4813,10 +4813,10 @@ async def lista_sorteios(interaction: discord.Interaction):
 @bot.tree.command(name="refazer_sorteio", description="Sorteia de novo usando a mesma mensagem e reacoes")
 @app_commands.describe(
     mensagem="Link da mensagem original do sorteio",
-    emoji="Emoji usado para participar (padrao: 🎉)",
+    emoji="Emoji usado para participar (opcional; o bot detecta sozinho)",
 )
 @app_commands.default_permissions(administrator=True)
-async def refazer_sorteio(interaction: discord.Interaction, mensagem: str, emoji: str = "🎉"):
+async def refazer_sorteio(interaction: discord.Interaction, mensagem: str, emoji: str = ""):
     """Escolhe novo ganhador da reacao de um painel que ja terminou."""
     if await bloquear_se_nao_for_staff(interaction):
         return
@@ -4843,10 +4843,17 @@ async def refazer_sorteio(interaction: discord.Interaction, mensagem: str, emoji
     except discord.Forbidden:
         return await interaction.followup.send("O bot nao tem permissao para ler essa mensagem.", ephemeral=True)
 
-    reacao_oficial = discord.utils.find(lambda reacao: str(reacao.emoji) == emoji, painel.reactions)
+    # A reacao oficial e a que o proprio bot adicionou ao criar o painel.
+    # Quando nenhum emoji e informado, isso evita falha por confundir 🎉 e 🎊.
+    emoji = emoji.strip()
+    reacao_oficial = (
+        discord.utils.find(lambda reacao: str(reacao.emoji) == emoji, painel.reactions)
+        if emoji else discord.utils.find(lambda reacao: reacao.me, painel.reactions)
+    )
     if not reacao_oficial:
+        emojis_disponiveis = ", ".join(str(reacao.emoji) for reacao in painel.reactions) or "nenhum"
         return await interaction.followup.send(
-            f"A mensagem nao possui a reacao {emoji} usada no sorteio.", ephemeral=True,
+            f"Nao encontrei a reacao do sorteio. Reacoes disponiveis: {emojis_disponiveis}.", ephemeral=True,
         )
 
     participantes_brutos = [user async for user in reacao_oficial.users()]
