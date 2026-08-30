@@ -3087,7 +3087,7 @@ async def encerrar_reuniao(interaction: discord.Interaction):
 
 def agendar_remocao_vip_unica(guild_id, user_id, cargo_id, canal_id, segundos_espera, chave_vip, vencimento_esperado):
     tarefa_anterior = tarefas_remocao_vip.get(chave_vip)
-    if tarefa_anterior and not tarefa_anterior.done():
+    if tarefa_anterior and tarefa_anterior is not asyncio.current_task() and not tarefa_anterior.done():
         tarefa_anterior.cancel()
 
     tarefa = bot.loop.create_task(
@@ -3710,19 +3710,41 @@ async def agendar_remocao_vip(guild_id, user_id, cargo_id, canal_id, segundos_es
             return
 
         guild = bot.get_guild(guild_id)
-        if guild:
-            membro = guild.get_member(user_id)
-            cargo = guild.get_role(cargo_id)
-            if membro and cargo:
+        membro = guild.get_member(user_id) if guild else None
+        cargo = guild.get_role(cargo_id) if guild else None
+        if guild and membro and cargo:
+            try:
+                await membro.remove_roles(cargo, reason="VIP temporario expirado")
+            except (discord.Forbidden, discord.HTTPException) as erro:
+                # Mantem o registro e tenta novamente: apagar o registro aqui
+                # faria o VIP ficar permanente caso a hierarquia esteja errada.
+                print(f"[VIP] Falha ao remover o cargo expirado {chave_vip}: {erro}")
+                agendar_remocao_vip_unica(
+                    guild_id, user_id, cargo_id, canal_id, 300,
+                    chave_vip, vencimento_esperado,
+                )
+                return
+
+            mensagem_expiracao = (
+                f"⚠ Olá! O seu tempo de VIP/Cargo **{cargo.name}** expirou no servidor "
+                f"**{guild.name}**! Fale com a Staff para renovar."
+            )
+            try:
+                await membro.send(mensagem_expiracao)
+            except (discord.Forbidden, discord.HTTPException):
+                print(f"[VIP] Nao consegui enviar PV de expiracao para {membro.id}.")
+
+            # O aviso no canal e sempre enviado, mesmo quando o PV chegou,
+            # para a staff ter um registro visivel do vencimento.
+            canal = guild.get_channel(canal_id) if canal_id else None
+            if canal:
                 try:
-                    await membro.remove_roles(cargo)
-                    await membro.send(f"⚠ Olá! O seu tempo de VIP/Cargo **{cargo.name}** expirou no servidor **{guild.name}**! Fale com a Staff para renovar.")
-                except discord.Forbidden:
-                    if canal_id:
-                        canal = guild.get_channel(canal_id)
-                        if canal: await canal.send(f"⚠ {membro.mention}, o seu VIP de **{cargo.name}** expirou! *(Aviso no chat pois seu PV está bloqueado)*.")
-                except Exception as erro:
-                    print(f"[VIP] Falha ao remover o cargo expirado {chave_vip}: {erro}")
+                    await canal.send(
+                        f"⚠ {membro.mention}, o VIP **{cargo.name}** expirou e o cargo foi removido. "
+                        "Um aviso tambem foi enviado por PV."
+                    )
+                except (discord.Forbidden, discord.HTTPException) as erro:
+                    print(f"[VIP] Nao consegui avisar expiracao no canal {canal_id}: {erro}")
 
         vips = carregar_vips()
         if vips.get(chave_vip) == vencimento_esperado:
@@ -4821,6 +4843,7 @@ async def dar_vip(interaction: discord.Interaction, membro: discord.Member, carg
         return await interaction.response.send_message("Escolha um cargo VIP comum, nao @everyone nem um cargo gerenciado.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
+    ja_possui_cargo = cargo in membro.roles
     try:
         vencimento = await conceder_vip_temporario(
             interaction.guild, membro, cargo, dias, "dias", interaction.channel.id,
@@ -4835,7 +4858,7 @@ async def dar_vip(interaction: discord.Interaction, membro: discord.Member, carg
         return await interaction.followup.send(f"Falha ao conceder o VIP: `{erro}`", ephemeral=True)
 
     await interaction.followup.send(
-        f"VIP **{cargo.name}** concedido a {membro.mention} por **{dias} dia(s)**. "
+        f"VIP **{cargo.name}** {'renovado' if ja_possui_cargo else 'concedido'} a {membro.mention} por **{dias} dia(s)**. "
         f"Expira em <t:{int(vencimento.timestamp())}:F>.",
         ephemeral=True,
     )
