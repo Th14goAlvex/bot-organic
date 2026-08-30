@@ -911,6 +911,20 @@ def usuario_e_staff(usuario):
 
     return False
 
+def participantes_elegiveis_sorteio(guild, participantes):
+    """Remove bots e a staff dos participantes de um sorteio."""
+    elegiveis = []
+    for participante in participantes:
+        if getattr(participante, "bot", False):
+            continue
+        # A lista da reacao pode devolver User em vez de Member. Recuperar o
+        # membro do cache permite verificar corretamente cargos e permissoes.
+        membro = guild.get_member(participante.id) or participante
+        if usuario_e_staff(membro):
+            continue
+        elegiveis.append(participante)
+    return elegiveis
+
 def normalizar_chave_personagem(txt):
     txt = remover_acentos(txt or "").lower()
     return re.sub(r'\s+', ' ', txt).strip()
@@ -3117,7 +3131,8 @@ async def loop_sorteios():
                     await canal.send(f" O sorteio **{dados['titulo']}** terminou, mas não consegui achar a reação oficial.")
                     continue
 
-                participantes = [user async for user in reacao_oficial.users() if not user.bot]
+                participantes = [user async for user in reacao_oficial.users()]
+                participantes = participantes_elegiveis_sorteio(guild, participantes)
                 
                 if not participantes:
                     await canal.send(f"😢 O sorteio **{dados['titulo']}** encerrou, mas ninguém participou!")
@@ -4794,6 +4809,66 @@ async def lista_sorteios(interaction: discord.Interaction):
         dt_fim = datetime.fromisoformat(dados['fim'])
         texto += f"• **{dados['titulo']}** termina em <t:{int(dt_fim.timestamp())}:R> (Canal: <#{dados['canal_id']}>)\n"
     await interaction.response.send_message(texto, ephemeral=True)
+
+@bot.tree.command(name="refazer_sorteio", description="Sorteia de novo usando a mesma mensagem e reacoes")
+@app_commands.describe(
+    mensagem="Link da mensagem original do sorteio",
+    emoji="Emoji usado para participar (padrao: 🎉)",
+)
+@app_commands.default_permissions(administrator=True)
+async def refazer_sorteio(interaction: discord.Interaction, mensagem: str, emoji: str = "🎉"):
+    """Escolhe novo ganhador da reacao de um painel que ja terminou."""
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    ids_link = re.findall(r"\d{15,22}", mensagem)
+    if len(ids_link) < 3:
+        return await interaction.followup.send(
+            "Envie o **link da mensagem** do painel do sorteio (Copiar link da mensagem).",
+            ephemeral=True,
+        )
+
+    guild_id, canal_id, mensagem_id = map(int, ids_link[-3:])
+    if not interaction.guild or guild_id != interaction.guild.id:
+        return await interaction.followup.send("O link precisa ser de uma mensagem deste servidor.", ephemeral=True)
+
+    canal = interaction.guild.get_channel(canal_id)
+    if not canal or not hasattr(canal, "fetch_message"):
+        return await interaction.followup.send("Nao encontrei o canal informado no link.", ephemeral=True)
+    try:
+        painel = await canal.fetch_message(mensagem_id)
+    except discord.NotFound:
+        return await interaction.followup.send("Nao encontrei a mensagem original do sorteio.", ephemeral=True)
+    except discord.Forbidden:
+        return await interaction.followup.send("O bot nao tem permissao para ler essa mensagem.", ephemeral=True)
+
+    reacao_oficial = discord.utils.find(lambda reacao: str(reacao.emoji) == emoji, painel.reactions)
+    if not reacao_oficial:
+        return await interaction.followup.send(
+            f"A mensagem nao possui a reacao {emoji} usada no sorteio.", ephemeral=True,
+        )
+
+    participantes_brutos = [user async for user in reacao_oficial.users()]
+    participantes = participantes_elegiveis_sorteio(interaction.guild, participantes_brutos)
+    excluidos = len(participantes_brutos) - len(participantes)
+    if not participantes:
+        return await interaction.followup.send(
+            "Nao ha participantes elegiveis: bots, administradores e staff nao entram no sorteio.",
+            ephemeral=True,
+        )
+
+    ganhador = random.choice(participantes)
+    titulo = painel.embeds[0].title if painel.embeds and painel.embeds[0].title else "Sorteio"
+    await canal.send(
+        f"🎉 **NOVO RESULTADO — {titulo}**\n"
+        f"{ganhador.mention} ganhou o novo sorteio! "
+        f"(Participantes elegiveis: {len(participantes)}; staff/bots excluidos: {excluidos}.)"
+    )
+    await interaction.followup.send(
+        f"Novo ganhador escolhido: {ganhador.mention}. Usei a mesma reacao da mensagem original.",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="adduser", description="Cria jogador direto no painel")
 @app_commands.describe(nome="Nome do jogador", senha="Senha do jogador")
