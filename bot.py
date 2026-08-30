@@ -3732,6 +3732,39 @@ async def agendar_remocao_vip(guild_id, user_id, cargo_id, canal_id, segundos_es
         if tarefas_remocao_vip.get(chave_vip) is asyncio.current_task():
             tarefas_remocao_vip.pop(chave_vip, None)
 
+async def conceder_vip_temporario(guild, membro, cargo, quantidade, unidade, canal_id, motivo):
+    """Concede/renova um VIP e deixa somente um vencimento por cargo e membro."""
+    if quantidade < 1:
+        raise ValueError("A quantidade precisa ser maior que zero.")
+
+    await membro.add_roles(cargo, reason=motivo)
+    if "minuto" in unidade.lower():
+        segundos_totais = quantidade * 60
+        vencimento = datetime.now() + timedelta(minutes=quantidade)
+    else:
+        segundos_totais = quantidade * 24 * 60 * 60
+        vencimento = datetime.now() + timedelta(days=quantidade)
+    vips = carregar_vips()
+    prefixo_chave = f"{membro.id}_{cargo.id}_"
+
+    # Uma renovacao substitui qualquer agendamento anterior do mesmo VIP,
+    # mesmo que ele tenha sido concedido antes por outro canal ou pelo !zomboid.
+    for chave_antiga in [chave for chave in vips if chave.startswith(prefixo_chave)]:
+        tarefa_antiga = tarefas_remocao_vip.pop(chave_antiga, None)
+        if tarefa_antiga and not tarefa_antiga.done():
+            tarefa_antiga.cancel()
+        del vips[chave_antiga]
+
+    chave_vip = f"{membro.id}_{cargo.id}_{canal_id}"
+    vencimento_iso = vencimento.isoformat()
+    vips[chave_vip] = vencimento_iso
+    salvar_vips(vips)
+    agendar_remocao_vip_unica(
+        guild.id, membro.id, cargo.id, canal_id,
+        segundos_totais, chave_vip, vencimento_iso,
+    )
+    return vencimento
+
 async def monitorar_mortes():
     if not CANAL_MORTES_ID: return
     caminhos = caminhos_mortes_friendhost()
@@ -4768,6 +4801,44 @@ def extrair_linha_comando(linha):
         resto = texto[len(prefixo):]
         return f"CMD:{ALIASES_CMD[prefixo]}{resto}"
     return None
+
+@bot.tree.command(name="dar_vip", description="Concede ou renova um cargo VIP por uma quantidade de dias")
+@app_commands.describe(
+    membro="Pessoa que recebera o VIP",
+    cargo="Cargo VIP ja existente no servidor",
+    dias="Quantidade de dias do VIP (de 1 a 3650)",
+)
+@app_commands.default_permissions(administrator=True)
+async def dar_vip(interaction: discord.Interaction, membro: discord.Member, cargo: discord.Role, dias: int):
+    """Alternativa em comando de barra ao DAR_VIP do !zomboid."""
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+    if not interaction.guild or not interaction.channel:
+        return await interaction.response.send_message("Este comando so funciona dentro de um servidor.", ephemeral=True)
+    if not 1 <= dias <= 3650:
+        return await interaction.response.send_message("Informe uma quantidade entre 1 e 3650 dias.", ephemeral=True)
+    if cargo == interaction.guild.default_role or cargo.managed:
+        return await interaction.response.send_message("Escolha um cargo VIP comum, nao @everyone nem um cargo gerenciado.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        vencimento = await conceder_vip_temporario(
+            interaction.guild, membro, cargo, dias, "dias", interaction.channel.id,
+            f"VIP concedido por {interaction.user} via /dar_vip",
+        )
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "Nao consegui dar esse cargo. Deixe o cargo do bot acima do cargo VIP e habilite Gerenciar cargos.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as erro:
+        return await interaction.followup.send(f"Falha ao conceder o VIP: `{erro}`", ephemeral=True)
+
+    await interaction.followup.send(
+        f"VIP **{cargo.name}** concedido a {membro.mention} por **{dias} dia(s)**. "
+        f"Expira em <t:{int(vencimento.timestamp())}:F>.",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="criar_sorteio", description="🎉 Cria um sorteio com reações automáticas")
 @app_commands.describe(titulo="Título do sorteio", subtitulo="Descrição do prêmio", minutos="Duração em minutos", emoji="Emoji da reação (padrão 🎉)", cargo_premio="Cargo VIP para o ganhador (opcional)")
@@ -6150,20 +6221,9 @@ async def on_message(message):
                                     if nome_novo.startswith("<@&"): nome_novo = "Novo Cargo VIP"
                                     cargo_vip = await guild.create_role(name=nome_novo, color=discord.Color.gold())
                                 try:
-                                    await membro.add_roles(cargo_vip)
-                                    if "minuto" in unidade:
-                                        segundos_totais = quantidade * 60
-                                        vencimento = datetime.now() + timedelta(minutes=quantidade)
-                                    else:
-                                        segundos_totais = quantidade * 24 * 60 * 60
-                                        vencimento = datetime.now() + timedelta(days=quantidade)
-                                    vips = carregar_vips()
-                                    chave_vip = f"{membro.id}_{cargo_vip.id}_{message.channel.id}"
-                                    vips[chave_vip] = vencimento.isoformat()
-                                    salvar_vips(vips)
-                                    agendar_remocao_vip_unica(
-                                        guild.id, membro.id, cargo_vip.id, message.channel.id,
-                                        segundos_totais, chave_vip, vencimento.isoformat(),
+                                    await conceder_vip_temporario(
+                                        guild, membro, cargo_vip, quantidade, unidade, message.channel.id,
+                                        f"VIP concedido por {message.author} via !zomboid",
                                     )
                                     await message.channel.send(f"💎 O cargo **{cargo_vip.name}** foi entregue a {membro.mention} por {quantidade} {unidade}! O relógio está a contar.")
                                 except discord.Forbidden: await message.channel.send(f" **ERRO:** Discord me bloqueou de dar o cargo **{cargo_vip.name}**. Arraste meu cargo pra cima dele nas configs.")
