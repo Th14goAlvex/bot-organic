@@ -155,6 +155,7 @@ ARQUIVO_STATUS = os.path.join(BASE_DIR, "status_jogadores.json")
 ARQUIVO_PENDENTES = os.path.join(BASE_DIR, "fichas_pendentes.json")
 ARQUIVO_MSG_STATUS = os.path.join(BASE_DIR, "msg_status_id.json") 
 ARQUIVO_SORTEIOS = os.path.join(BASE_DIR, "sorteios.json")
+ARQUIVO_CARGOS_REACAO = os.path.join(BASE_DIR, "cargos_reacao.json")
 ARQUIVO_PERSONAGENS = os.path.join(BASE_DIR, "personagens.json")
 ARQUIVO_HISTORICO_PERSONAGENS = os.path.join(BASE_DIR, "historico_personagens.json")
 ARQUIVO_REGISTROS_PERSONAGENS = os.path.join(BASE_DIR, "registros_personagens.json")
@@ -475,6 +476,12 @@ def carregar_sorteios():
 
 def salvar_sorteios(dados):
     salvar_json_seguro(ARQUIVO_SORTEIOS, dados)
+
+def carregar_cargos_reacao():
+    return carregar_json_seguro(ARQUIVO_CARGOS_REACAO, {})
+
+def salvar_cargos_reacao(dados):
+    salvar_json_seguro(ARQUIVO_CARGOS_REACAO, dados)
 
 def carregar_personagens():
     return carregar_json_seguro(ARQUIVO_PERSONAGENS, {})
@@ -4310,6 +4317,7 @@ Ações CMD:
 - Tirar/Remover cargo de um jogador: CMD:REMOVER_CARGO|NomeDoCargo|ID_do_User
 - Criar Canal: CMD:CRIAR_CANAL|NomeDoCanal|Privado(sim/nao)
 - Dar cargo PERMANENTE: CMD:ADD_ROLE|NomeDoCargo|ID_do_User
+- Colocar reacao em uma mensagem para dar um cargo comum a quem reagir (tirar a reacao NAO remove o cargo): CMD:CRIAR_CARGO_REACAO|LinkDaMensagem|Emoji|NomeOuMencaoDoCargo
 - Dar cargo/VIP TEMPORRIO: CMD:DAR_VIP|NomeDoVIP|ID_do_User|Quantidade|Unidade
 - Remover/Apagar VIP de um jogador antes do tempo: CMD:REMOVER_REGISTRO_VIP|ID_do_User
 - Adicionar ou Diminuir tempo de um VIP já existente: CMD:MODIFICAR_VIP|Ação(adicionar/diminuir)|ID_do_User|Quantidade|Unidade
@@ -4818,6 +4826,61 @@ async def buscar_mensagem_em_canal(canal, mensagem_id):
     except Exception:
         return None
 
+def extrair_ids_link_mensagem(link_mensagem):
+    """Retorna guild, canal e mensagem a partir de um link do Discord."""
+    ids = re.findall(r"\d{15,22}", link_mensagem or "")
+    if len(ids) < 3:
+        return None
+    return tuple(map(int, ids[-3:]))
+
+def chave_cargo_reacao(guild_id, mensagem_id, emoji):
+    return f"{guild_id}:{mensagem_id}:{str(emoji).strip()}"
+
+def cargo_seguro_para_reacao(guild, cargo):
+    """Impede que uma reacao publica entregue cargos de moderacao/admin."""
+    if not cargo or cargo == guild.default_role or getattr(cargo, "managed", False):
+        return False
+    permissoes_perigosas = (
+        "administrator", "manage_guild", "manage_roles", "manage_channels",
+        "kick_members", "ban_members", "moderate_members",
+    )
+    permissoes = getattr(cargo, "permissions", None)
+    if permissoes is None:
+        return False
+    return not any(getattr(permissoes, nome, False) for nome in permissoes_perigosas)
+
+async def configurar_cargo_reacao(guild, link_mensagem, emoji, cargo, autor):
+    """Registra uma reacao que concede cargo sem retira-lo ao desmarcar."""
+    destino = extrair_ids_link_mensagem(link_mensagem)
+    if not destino:
+        raise ValueError("Envie o link da mensagem alvo (Copiar link da mensagem).")
+    guild_id, canal_id, mensagem_id = destino
+    if guild_id != guild.id:
+        raise ValueError("A mensagem precisa pertencer a este servidor.")
+    if not emoji or not emoji.strip():
+        raise ValueError("Informe um emoji valido.")
+    if not cargo_seguro_para_reacao(guild, cargo):
+        raise ValueError("Escolha um cargo comum, sem permissoes de moderacao/admin.")
+
+    canal = guild.get_channel(canal_id)
+    mensagem = await buscar_mensagem_em_canal(canal, mensagem_id)
+    if not mensagem:
+        raise ValueError("Nao encontrei a mensagem. Confira o link e a permissao de ler o canal.")
+
+    emoji = emoji.strip()
+    await mensagem.add_reaction(emoji)
+    registros = carregar_cargos_reacao()
+    registros[chave_cargo_reacao(guild.id, mensagem.id, emoji)] = {
+        "guild_id": guild.id,
+        "canal_id": canal.id,
+        "mensagem_id": mensagem.id,
+        "emoji": emoji,
+        "cargo_id": cargo.id,
+        "autor_id": autor.id,
+    }
+    salvar_cargos_reacao(registros)
+    return mensagem
+
 ALIASES_CMD = {
     "ADICIONAR_EMOJI_CANAL": "EMOJI_CANAL",
     "MUDAR_EMOJI_CANAL": "EMOJI_CANAL",
@@ -4988,6 +5051,37 @@ async def refazer_sorteio(interaction: discord.Interaction, mensagem: str, emoji
     )
     await interaction.followup.send(
         f"Novo ganhador escolhido: {ganhador.mention}. Usei a mesma reacao da mensagem original.",
+        ephemeral=True,
+    )
+
+@bot.tree.command(name="cargo_por_reacao", description="Da um cargo quando alguem reage a uma mensagem")
+@app_commands.describe(
+    mensagem="Link da mensagem que recebera a reacao",
+    emoji="Emoji que o jogador deve clicar",
+    cargo="Cargo comum que sera entregue",
+)
+@app_commands.default_permissions(administrator=True)
+async def cargo_por_reacao(interaction: discord.Interaction, mensagem: str, emoji: str, cargo: discord.Role):
+    """Cria uma reacao persistente que somente concede cargo."""
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+    if not interaction.guild:
+        return await interaction.response.send_message("Este comando so funciona dentro de um servidor.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        painel = await configurar_cargo_reacao(interaction.guild, mensagem, emoji, cargo, interaction.user)
+    except ValueError as erro:
+        return await interaction.followup.send(f"⚠ {erro}", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException) as erro:
+        return await interaction.followup.send(
+            f"Nao consegui adicionar a reacao. Verifique as permissoes do bot no canal. (`{erro}`)",
+            ephemeral=True,
+        )
+
+    await interaction.followup.send(
+        f"Pronto: quem reagir com {emoji} em [esta mensagem]({painel.jump_url}) recebera **{cargo.name}**. "
+        "Retirar a reacao nao remove o cargo.",
         ephemeral=True,
     )
 
@@ -6022,6 +6116,40 @@ async def on_voice_state_update(member, before, after):
     tarefas_retorno_call_protegida[member.id] = tarefa
 
 @bot.event
+async def on_raw_reaction_add(payload):
+    """Entrega cargo configurado ao reagir; remover a reacao nunca tira cargo."""
+    if not payload.guild_id or (bot.user and payload.user_id == bot.user.id):
+        return
+
+    registros = carregar_cargos_reacao()
+    dados = registros.get(chave_cargo_reacao(payload.guild_id, payload.message_id, payload.emoji))
+    if not dados:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    membro = payload.member or guild.get_member(payload.user_id)
+    if not membro:
+        try:
+            membro = await guild.fetch_member(payload.user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    cargo = guild.get_role(dados.get("cargo_id"))
+    if not cargo or not cargo_seguro_para_reacao(guild, cargo):
+        print(f"[CARGO REACAO] Cargo invalido ou inseguro no painel {payload.message_id}.")
+        return
+    if cargo in membro.roles:
+        return
+
+    try:
+        await membro.add_roles(cargo, reason=f"Cargo por reacao na mensagem {payload.message_id}")
+        print(f"[CARGO REACAO] {membro} recebeu {cargo.name} pela mensagem {payload.message_id}.")
+    except (discord.Forbidden, discord.HTTPException) as erro:
+        print(f"[CARGO REACAO] Nao consegui dar {cargo.name} a {membro.id}: {erro}")
+
+@bot.event
 async def on_message(message):
     if message.author == bot.user: return
 
@@ -6132,6 +6260,27 @@ async def on_message(message):
                                     await membro.add_roles(cargo)
                                     await message.channel.send(f"✅ Cargo **{cargo.name}** dado a {membro.mention}!")
                                 else: await message.channel.send("  Cargo ou membro não encontrado.")
+                            encontrou_comando = True
+
+                        elif acao == "CRIAR_CARGO_REACAO":
+                            link_mensagem = dados[1]
+                            emoji_reacao = dados[2]
+                            cargo_reacao = encontrar_cargo(guild, dados[3])
+                            if not cargo_reacao:
+                                await message.channel.send("Nao encontrei o cargo informado para a reacao.")
+                            else:
+                                try:
+                                    painel = await configurar_cargo_reacao(
+                                        guild, link_mensagem, emoji_reacao, cargo_reacao, message.author,
+                                    )
+                                    await message.channel.send(
+                                        f"✅ Reacao {emoji_reacao} adicionada em {painel.jump_url}. "
+                                        f"Quem clicar recebera **{cargo_reacao.name}** e nao perdera o cargo ao desmarcar."
+                                    )
+                                except ValueError as erro:
+                                    await message.channel.send(f"⚠ Nao consegui criar a reacao por cargo: {erro}")
+                                except (discord.Forbidden, discord.HTTPException) as erro:
+                                    await message.channel.send(f"⚠ Discord bloqueou a criacao da reacao por cargo: {erro}")
                             encontrou_comando = True
 
                         elif acao == "CRIAR_CANAL":
