@@ -4312,11 +4312,12 @@ Ações CMD:
 - Entrar na voz: CMD:ENTRAR_VOZ
 - Gravar: CMD:GRAVAR_VOZ
 - Parar: CMD:PARAR_VOZ
-- Criar cargo: CMD:CRIAR_CARGO|NomeDoCargo|Cor
+- Criar cargo: CMD:CRIAR_CARGO|NomeDoCargo|Cor (aceita cores como verde claro, azul escuro ou hexadecimal #RRGGBB)
 - Apagar/Excluir cargo do servidor: CMD:DELETAR_CARGO|NomeDoCargo
 - Tirar/Remover cargo de um jogador: CMD:REMOVER_CARGO|NomeDoCargo|ID_do_User
 - Criar Canal: CMD:CRIAR_CANAL|NomeDoCanal|Privado(sim/nao)
-- Dar cargo PERMANENTE: CMD:ADD_ROLE|NomeDoCargo|ID_do_User
+- Dar cargo PERMANENTE a uma ou mais pessoas: CMD:ADD_ROLE|NomeOuMencaoDoCargo|IDsOuMencoesSeparadosPorVirgula
+- Alterar cor, destaque e/ou ordem de cargo: CMD:CONFIGURAR_CARGO|NomeOuMencaoDoCargo|CorOuVazio|AcimaDeNomeOuMencaoOuVazio|Destacar(sim/nao)
 - Colocar reacao em uma mensagem para dar um cargo comum a quem reagir (tirar a reacao NAO remove o cargo): CMD:CRIAR_CARGO_REACAO|LinkDaMensagem|Emoji|NomeOuMencaoDoCargo
 - Dar cargo/VIP TEMPORRIO: CMD:DAR_VIP|NomeDoVIP|ID_do_User|Quantidade|Unidade
 - Remover/Apagar VIP de um jogador antes do tempo: CMD:REMOVER_REGISTRO_VIP|ID_do_User
@@ -4333,6 +4334,10 @@ Ações CMD:
 - Consultar o último registro de personagem de um jogador: CMD:CONSULTAR_REGISTRO_PERSONAGEM|IDOuNomeDoPlayer
 - Fechar canais/tickets: CMD:FECHAR_CANAIS|canal1,canal2
 - Fechar TODOS tickets de categoria: CMD:FECHAR_CATEGORIA|NomeDaCategoria
+
+Exemplos obrigatorios:
+- "de o cargo <@&10> para <@20> e <@30>" => CMD:ADD_ROLE|<@&10>|<@20>,<@30>
+- "deixe Adapt verde claro, acima de VIP e destacado" => CMD:CONFIGURAR_CARGO|Adapt|verde claro|VIP|sim
 """
 CONTEXTO_ATA_GEMINI = """
 Você é um analista de reuniões em português do Brasil.
@@ -4741,14 +4746,24 @@ async def roteador_groq(chat_id, user_msg):
 
 def pegar_cor(nome_cor):
     if not nome_cor: return discord.Color.default()
-    c = nome_cor.lower().strip()
+    c = nome_cor.lower().strip().replace("-", " ")
+    hexadecimal = c.removeprefix("#")
+    if re.fullmatch(r"[0-9a-f]{6}", hexadecimal):
+        return discord.Color(int(hexadecimal, 16))
     mapa = {
         'blue': discord.Color.blue(), 'azul': discord.Color.blue(),
         'red': discord.Color.red(), 'vermelho': discord.Color.red(),
         'green': discord.Color.green(), 'verde': discord.Color.green(),
+        'light green': discord.Color.from_rgb(144, 238, 144), 'verde claro': discord.Color.from_rgb(144, 238, 144),
+        'lime': discord.Color.from_rgb(50, 205, 50), 'verde lima': discord.Color.from_rgb(50, 205, 50),
+        'dark green': discord.Color.dark_green(), 'verde escuro': discord.Color.dark_green(),
+        'light blue': discord.Color.from_rgb(135, 206, 235), 'azul claro': discord.Color.from_rgb(135, 206, 235),
+        'dark blue': discord.Color.dark_blue(), 'azul escuro': discord.Color.dark_blue(),
         'gold': discord.Color.gold(), 'amarelo': discord.Color.gold(), 'ouro': discord.Color.gold(),
+        'yellow': discord.Color.gold(),
         'pink': discord.Color.from_rgb(255, 105, 180), 'rosa': discord.Color.from_rgb(255, 105, 180),
         'purple': discord.Color.purple(), 'roxo': discord.Color.purple(),
+        'light purple': discord.Color.from_rgb(203, 153, 201), 'roxo claro': discord.Color.from_rgb(203, 153, 201),
         'orange': discord.Color.orange(), 'laranja': discord.Color.orange(),
         'black': discord.Color.from_rgb(1, 1, 1), 'preto': discord.Color.from_rgb(1, 1, 1),
         'white': discord.Color.from_rgb(255, 255, 255), 'branco': discord.Color.from_rgb(255, 255, 255)
@@ -4764,6 +4779,33 @@ def encontrar_cargo(guild, busca):
     for r in guild.roles:
         if r.name.lower() == busca.lower(): return r
     return None
+
+async def configurar_aparencia_e_posicao_cargo(guild, cargo, cor, referencia_acima, destacar, motivo):
+    """Atualiza cor, destaque e posicao de um cargo respeitando a hierarquia do bot."""
+    alteracoes = {}
+    if cor and cor.lower().strip() not in {"", "nenhuma", "padrao", "default"}:
+        alteracoes["colour"] = pegar_cor(cor)
+    if destacar.lower().strip() in {"sim", "s", "true", "destacar", "destacado"}:
+        alteracoes["hoist"] = True
+    elif destacar.lower().strip() in {"nao", "não", "n", "false", "normal"}:
+        alteracoes["hoist"] = False
+    if alteracoes:
+        cargo = await cargo.edit(reason=motivo, **alteracoes)
+
+    referencia_texto = (referencia_acima or "").strip()
+    if referencia_texto.lower().startswith("acima_de:"):
+        referencia_texto = referencia_texto.split(":", 1)[1].strip()
+    if referencia_texto:
+        referencia = encontrar_cargo(guild, referencia_texto)
+        if not referencia:
+            raise ValueError("Nao encontrei o cargo de referencia para posicionar acima.")
+        membro_bot = guild.me or guild.get_member(bot.user.id)
+        limite_superior = membro_bot.top_role.position - 1 if membro_bot else cargo.position
+        nova_posicao = min(referencia.position + 1, limite_superior)
+        if nova_posicao <= referencia.position:
+            raise ValueError("O cargo do bot precisa estar acima do cargo que sera movido.")
+        cargo = await cargo.edit(position=nova_posicao, reason=motivo)
+    return cargo
 
 def normalizar_nome_canal(busca):
     if not busca:
@@ -6252,14 +6294,41 @@ async def on_message(message):
 
                         elif acao == "ADD_ROLE":
                             nome_cargo = dados[1]
-                            id_alvo = "".join(filter(str.isdigit, dados[2]))
-                            if id_alvo and nome_cargo:
-                                membro = guild.get_member(int(id_alvo))
+                            ids_alvo = re.findall(r"\d{15,22}", dados[2])
+                            if ids_alvo and nome_cargo:
                                 cargo = encontrar_cargo(guild, nome_cargo)
-                                if membro and cargo:
-                                    await membro.add_roles(cargo)
-                                    await message.channel.send(f"✅ Cargo **{cargo.name}** dado a {membro.mention}!")
-                                else: await message.channel.send("  Cargo ou membro não encontrado.")
+                                if cargo:
+                                    entregues, ausentes = [], []
+                                    for id_alvo in dict.fromkeys(ids_alvo):
+                                        membro = guild.get_member(int(id_alvo))
+                                        if not membro:
+                                            ausentes.append(f"<@{id_alvo}>")
+                                            continue
+                                        await membro.add_roles(cargo, reason=f"Cargo dado por {message.author} via !zomboid")
+                                        entregues.append(membro.mention)
+                                    resposta = f"✅ Cargo **{cargo.name}** dado para: {', '.join(entregues) or 'ninguem'}"
+                                    if ausentes:
+                                        resposta += f"\n⚠ Nao encontrei: {', '.join(ausentes)}"
+                                    await message.channel.send(resposta)
+                                else:
+                                    await message.channel.send("Cargo nao encontrado.")
+                            encontrou_comando = True
+
+                        elif acao == "CONFIGURAR_CARGO":
+                            cargo = encontrar_cargo(guild, dados[1])
+                            if not cargo:
+                                await message.channel.send("Nao encontrei o cargo que voce quer configurar.")
+                            else:
+                                try:
+                                    cargo = await configurar_aparencia_e_posicao_cargo(
+                                        guild, cargo, dados[2], dados[3], dados[4],
+                                        f"Cargo configurado por {message.author} via !zomboid",
+                                    )
+                                    await message.channel.send(f"✅ Cargo **{cargo.name}** configurado.")
+                                except ValueError as erro:
+                                    await message.channel.send(f"⚠ Nao consegui configurar o cargo: {erro}")
+                                except (discord.Forbidden, discord.HTTPException) as erro:
+                                    await message.channel.send(f"⚠ Discord bloqueou a configuracao do cargo: {erro}")
                             encontrou_comando = True
 
                         elif acao == "CRIAR_CARGO_REACAO":
