@@ -3718,10 +3718,27 @@ async def agendar_remocao_vip(guild_id, user_id, cargo_id, canal_id, segundos_es
         if guild and membro and cargo:
             try:
                 await membro.remove_roles(cargo, reason="VIP temporario expirado")
-            except (discord.Forbidden, discord.HTTPException) as erro:
+                # Confirma pelo servidor, pois uma mensagem de aviso sem a
+                # remocao real do cargo deixaria o VIP permanente por engano.
+                membro_atualizado = await guild.fetch_member(user_id)
+                ainda_tem_cargo = any(role.id == cargo_id for role in membro_atualizado.roles)
+                if ainda_tem_cargo:
+                    raise RuntimeError("o Discord confirmou a conta, mas o cargo continua aplicado")
+            except discord.NotFound:
+                # Se a pessoa saiu do servidor, ela ja nao mantem o cargo.
+                pass
+            except (discord.Forbidden, discord.HTTPException, RuntimeError) as erro:
                 # Mantem o registro e tenta novamente: apagar o registro aqui
                 # faria o VIP ficar permanente caso a hierarquia esteja errada.
                 print(f"[VIP] Falha ao remover o cargo expirado {chave_vip}: {erro}")
+                canal = guild.get_channel(canal_id) if canal_id else None
+                if canal:
+                    with suppress(discord.Forbidden, discord.HTTPException):
+                        await canal.send(
+                            f"⚠ Nao consegui retirar o VIP **{cargo.name}** de {membro.mention}. "
+                            "Verifique se o cargo do bot esta acima do VIP e se ele tem **Gerenciar cargos**. "
+                            "O bot tentara novamente em 5 minutos."
+                        )
                 agendar_remocao_vip_unica(
                     guild_id, user_id, cargo_id, canal_id, 300,
                     chave_vip, vencimento_esperado,
