@@ -36,6 +36,9 @@ print("--- INICIANDO ZOMBOIDOS V148 (RCON TEIMOSO COM TENTATIVAS MÚLTIPLAS) �
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# O Llama 3.3 70B foi removido para chaves free/developer em 16/08/2026.
+# Pode ser alterado no .env sem editar o codigo se a Groq trocar o catalogo.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
 
 # =========================================================
 # CONFIGURAÇÃO DO MAMALIO + STATUS
@@ -4702,7 +4705,7 @@ async def roteador_groq(chat_id, user_msg):
         memorias_ultima_atividade[chat_id] = agora
 
         completion = await asyncio.wait_for(
-            asyncio.to_thread(client_groq.chat.completions.create, model="llama-3.3-70b-versatile", messages=historico, temperature=0.3),
+            asyncio.to_thread(client_groq.chat.completions.create, model=GROQ_MODEL, messages=historico, temperature=0.3),
             timeout=15.0
         )
         return completion.choices[0].message.content
@@ -6005,7 +6008,11 @@ async def on_voice_state_update(member, before, after):
 async def on_message(message):
     if message.author == bot.user: return
 
-    await bot.process_commands(message)
+    conteudo = message.content or ""
+    # !zomboid e tratado abaixo como chat de IA, nao como comando prefixado
+    # do discord.py. Assim ele nao gera CommandNotFound no log a cada uso.
+    if not conteudo.lower().startswith("!zomboid"):
+        await bot.process_commands(message)
 
     if categoria_processa_ficha_pos_morte(getattr(message.channel, "category", None)):
         if mensagem_parece_formulario_ficha(message):
@@ -6013,7 +6020,7 @@ async def on_message(message):
             await avisar_ficha_formato_antigo(message.channel, message.author)
             return
 
-    if message.content.startswith('!zomboid'):
+    if conteudo.lower().startswith('!zomboid'):
         # TRAVA DE CUSTO: a checagem de permissao acontece ANTES de qualquer
         # chamada de API. Jogador comum nunca chega a gastar token do Groq.
         if not usuario_e_staff(message.author):
@@ -6024,7 +6031,7 @@ async def on_message(message):
                 )
             return
 
-        usuario_texto = message.content.replace('!zomboid', '').strip()
+        usuario_texto = conteudo[len('!zomboid'):].strip()
         chat_id = message.channel.id
 
         if usuario_texto.lower() == "esquecer tudo":
