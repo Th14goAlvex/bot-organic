@@ -201,6 +201,7 @@ tarefa_monitor_call_ingame = None
 tarefa_varredura_fichas = None
 tarefa_retomar_analises = None
 tarefa_fichas_pendentes = None
+tarefa_sincronizar_cargos_reacao = None
 varredura_fichas_executada = False
 controle_call_ingame = {}
 tarefas_retorno_call_protegida = {}
@@ -3000,6 +3001,7 @@ class ZomboidBot(commands.Bot):
             tarefa_varredura_fichas,
             tarefa_retomar_analises,
             tarefa_fichas_pendentes,
+            tarefa_sincronizar_cargos_reacao,
             *tarefas_remocao_vip.values(),
             *tarefas_fichas,
         ] if tarefa is not None]
@@ -4908,10 +4910,18 @@ async def configurar_cargo_reacao(guild, link_mensagem, emoji, cargo, autor):
     mensagem = await buscar_mensagem_em_canal(canal, mensagem_id)
     if not mensagem:
         raise ValueError("Nao encontrei a mensagem. Confira o link e a permissao de ler o canal.")
+    membro_bot = guild.me or guild.get_member(bot.user.id)
+    if not membro_bot or not canal.permissions_for(membro_bot).manage_messages:
+        raise ValueError("O bot precisa da permissao Gerenciar mensagens nesse canal para manter somente uma reacao.")
 
     emoji = emoji.strip()
     await mensagem.add_reaction(emoji)
     registros = carregar_cargos_reacao()
+    # Um painel tem exatamente uma reacao permitida. Uma nova configuracao na
+    # mesma mensagem substitui qualquer cargo/reacao configurado antes.
+    for chave, dados in list(registros.items()):
+        if dados.get("guild_id") == guild.id and dados.get("mensagem_id") == mensagem.id:
+            del registros[chave]
     registros[chave_cargo_reacao(guild.id, mensagem.id, emoji)] = {
         "guild_id": guild.id,
         "canal_id": canal.id,
@@ -4920,8 +4930,54 @@ async def configurar_cargo_reacao(guild, link_mensagem, emoji, cargo, autor):
         "cargo_id": cargo.id,
         "autor_id": autor.id,
     }
+    for reacao in list(mensagem.reactions):
+        if str(reacao.emoji) != emoji:
+            await reacao.clear()
     salvar_cargos_reacao(registros)
     return mensagem
+
+def registros_cargo_reacao_da_mensagem(registros, guild_id, mensagem_id):
+    return [
+        dados for dados in registros.values()
+        if dados.get("guild_id") == guild_id and dados.get("mensagem_id") == mensagem_id
+    ]
+
+async def remover_reacao_nao_permitida(guild, membro, canal_id, mensagem_id, emoji):
+    canal = guild.get_channel(canal_id)
+    mensagem = await buscar_mensagem_em_canal(canal, mensagem_id)
+    if mensagem:
+        await mensagem.remove_reaction(emoji, membro)
+
+async def sincronizar_paineis_cargo_reacao():
+    """Limpa paineis antigos e concede os cargos a quem ja tinha reagido."""
+    for dados in carregar_cargos_reacao().values():
+        guild = bot.get_guild(dados.get("guild_id"))
+        if not guild:
+            continue
+        cargo = guild.get_role(dados.get("cargo_id"))
+        canal = guild.get_channel(dados.get("canal_id"))
+        if not cargo or not canal or not cargo_seguro_para_reacao(guild, cargo):
+            continue
+        try:
+            mensagem = await canal.fetch_message(dados["mensagem_id"])
+            await mensagem.add_reaction(dados["emoji"])
+            reacao_oficial = discord.utils.find(lambda item: str(item.emoji) == dados["emoji"], mensagem.reactions)
+            if not reacao_oficial:
+                continue
+            async for usuario in reacao_oficial.users():
+                if usuario.bot:
+                    continue
+                membro = guild.get_member(usuario.id)
+                if not membro:
+                    with suppress(discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        membro = await guild.fetch_member(usuario.id)
+                if membro and cargo not in membro.roles:
+                    await membro.add_roles(cargo, reason=f"Sincronizacao de cargo por reacao na mensagem {mensagem.id}")
+            for reacao in list(mensagem.reactions):
+                if str(reacao.emoji) != dados["emoji"]:
+                    await reacao.clear()
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as erro:
+            print(f"[CARGO REACAO] Nao consegui sincronizar o painel {dados.get('mensagem_id')}: {erro}")
 
 ALIASES_CMD = {
     "ADICIONAR_EMOJI_CANAL": "EMOJI_CANAL",
@@ -5998,7 +6054,7 @@ async def fechar_ticket(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    global tarefa_monitor_mortes, tarefa_monitor_eventos, tarefa_monitor_call_ingame, tarefa_varredura_fichas, tarefa_retomar_analises
+    global tarefa_monitor_mortes, tarefa_monitor_eventos, tarefa_monitor_call_ingame, tarefa_varredura_fichas, tarefa_retomar_analises, tarefa_sincronizar_cargos_reacao
     await bot.change_presence(activity=discord.Game(name="TRABALHANDO..."))
     print(f'✅ Sistema V148 Online e Vigiando!')
     sincronizar_historico_com_personagens_atuais()
@@ -6024,6 +6080,8 @@ async def on_ready():
         tarefa_retomar_analises = bot.loop.create_task(retomar_fichas_em_analise())
     if tarefa_varredura_fichas is None or tarefa_varredura_fichas.done():
         tarefa_varredura_fichas = bot.loop.create_task(varrer_tickets_abertos_fichas())
+    if tarefa_sincronizar_cargos_reacao is None or tarefa_sincronizar_cargos_reacao.done():
+        tarefa_sincronizar_cargos_reacao = bot.loop.create_task(sincronizar_paineis_cargo_reacao())
     with suppress(Exception):
         await descartar_fichas_formato_antigo()
 
@@ -6159,13 +6217,13 @@ async def on_voice_state_update(member, before, after):
 
 @bot.event
 async def on_raw_reaction_add(payload):
-    """Entrega cargo configurado ao reagir; remover a reacao nunca tira cargo."""
+    """Mantem painel limpo e entrega cargo pela unica reacao permitida."""
     if not payload.guild_id or (bot.user and payload.user_id == bot.user.id):
         return
 
     registros = carregar_cargos_reacao()
-    dados = registros.get(chave_cargo_reacao(payload.guild_id, payload.message_id, payload.emoji))
-    if not dados:
+    paineis_da_mensagem = registros_cargo_reacao_da_mensagem(registros, payload.guild_id, payload.message_id)
+    if not paineis_da_mensagem:
         return
 
     guild = bot.get_guild(payload.guild_id)
@@ -6177,6 +6235,16 @@ async def on_raw_reaction_add(payload):
             membro = await guild.fetch_member(payload.user_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
+
+    dados = registros.get(chave_cargo_reacao(payload.guild_id, payload.message_id, payload.emoji))
+    if not dados:
+        try:
+            await remover_reacao_nao_permitida(
+                guild, membro, payload.channel_id, payload.message_id, payload.emoji,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            print(f"[CARGO REACAO] Nao consegui remover reacao nao permitida em {payload.message_id}.")
+        return
 
     cargo = guild.get_role(dados.get("cargo_id"))
     if not cargo or not cargo_seguro_para_reacao(guild, cargo):
