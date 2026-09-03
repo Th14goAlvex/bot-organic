@@ -205,6 +205,8 @@ tarefa_sincronizar_cargos_reacao = None
 varredura_fichas_executada = False
 controle_call_ingame = {}
 tarefas_retorno_call_protegida = {}
+# Evita que o proprio retorno do bot seja interpretado como um novo arraste.
+retornos_automaticos_call_protegida = {}
 tarefas_remocao_vip = {}
 tarefas_fichas = set()
 tarefas_fichas_por_chave = {}
@@ -6133,28 +6135,35 @@ async def on_ready():
         del vips[chave]
     if remover_imediatamente: salvar_vips(vips)
 
-async def movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
-    """Confere o log de auditoria para distinguir arraste de mudanca voluntaria."""
-    limite = datetime.now(timezone.utc) - timedelta(seconds=12)
+async def movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id, evento_em, canal_destino_id):
+    """Confirma no audit log o arraste que causou este evento de voz."""
+    # O audit log pode ter segundos de diferenca em relacao ao gateway. A
+    # pequena margem impede falha por relogio, sem aceitar um arraste antigo.
+    limite = evento_em - timedelta(seconds=3)
     try:
-        async for entrada in guild.audit_logs(limit=8, action=discord.AuditLogAction.member_move):
+        async for entrada in guild.audit_logs(limit=20, action=discord.AuditLogAction.member_move):
             alvo = getattr(entrada, "target", None)
             if not alvo or getattr(alvo, "id", None) != membro_id:
                 continue
             criado_em = getattr(entrada, "created_at", None)
             if not criado_em or criado_em < limite:
                 continue
+            canal_log = getattr(getattr(entrada, "extra", None), "channel", None)
+            canal_log_id = getattr(canal_log, "id", None)
+            if canal_log_id is not None and canal_log_id != canal_destino_id:
+                continue
             executor = getattr(entrada, "user", None)
             if executor and executor.id not in {membro_id, getattr(bot.user, "id", None)}:
+                print(f"[CALL PROTEGIDA] Arraste confirmado: {executor} moveu o usuario {membro_id}.")
                 return True
     except (discord.Forbidden, discord.HTTPException) as erro:
         print(f"[CALL PROTEGIDA] Nao consegui ler o registro de auditoria: {erro}")
     return False
 
-async def aguardar_confirmacao_movimento_externo(guild, membro_id, tentativas=4):
-    """O audit log pode aparecer alguns segundos depois do evento de voz."""
+async def aguardar_confirmacao_movimento_externo(guild, membro_id, evento_em, canal_destino_id, tentativas=10):
+    """O audit log pode demorar varios segundos para aparecer no Discord."""
     for tentativa in range(tentativas):
-        if await movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id):
+        if await movimento_de_call_foi_feito_por_outra_pessoa(guild, membro_id, evento_em, canal_destino_id):
             return True
         if tentativa + 1 < tentativas:
             await asyncio.sleep(1)
@@ -6164,11 +6173,15 @@ async def processar_retorno_call_protegida(guild_id, membro_id, canal_origem_id,
     """Devolve o usuario protegido somente apos um arraste confirmado."""
     try:
         inicio = time.monotonic()
+        evento_em = datetime.now(timezone.utc)
         guild = bot.get_guild(guild_id)
         membro = guild.get_member(membro_id) if guild else None
         if not guild or not membro:
             return
-        if not await aguardar_confirmacao_movimento_externo(guild, membro_id):
+        if not await aguardar_confirmacao_movimento_externo(
+            guild, membro_id, evento_em, canal_destino_id,
+        ):
+            print("[CALL PROTEGIDA] Troca de call ignorada: nao houve arraste externo confirmado no audit log.")
             return
 
         # A espera total e de 5s desde o arraste. O tempo gasto esperando o
@@ -6185,6 +6198,7 @@ async def processar_retorno_call_protegida(guild_id, membro_id, canal_origem_id,
         if not membro or not canal_origem or not canal_atual or canal_atual.id != canal_destino_id:
             return
 
+        retornos_automaticos_call_protegida[membro_id] = canal_origem_id
         await membro.move_to(canal_origem, reason="Protecao contra movimentacao de call nao autorizada")
         print(f"[CALL PROTEGIDA] {membro} voltou para {canal_origem.name} apos ser movido por outra pessoa.")
     except (discord.Forbidden, discord.HTTPException) as erro:
@@ -6204,6 +6218,12 @@ async def on_voice_state_update(member, before, after):
     if before.channel is None or after.channel is None or before.channel.id == after.channel.id:
         return
 
+    # O evento provocado pelo move_to do proprio bot nao deve cancelar nem
+    # disparar outra verificacao de arraste.
+    if retornos_automaticos_call_protegida.get(member.id) == after.channel.id:
+        retornos_automaticos_call_protegida.pop(member.id, None)
+        return
+
     tarefa_anterior = tarefas_retorno_call_protegida.pop(member.id, None)
     if tarefa_anterior and not tarefa_anterior.done():
         tarefa_anterior.cancel()
@@ -6214,6 +6234,7 @@ async def on_voice_state_update(member, before, after):
         )
     )
     tarefas_retorno_call_protegida[member.id] = tarefa
+    print(f"[CALL PROTEGIDA] Troca detectada: {before.channel.name} -> {after.channel.name}; aguardando confirmacao.")
 
 @bot.event
 async def on_raw_reaction_add(payload):
