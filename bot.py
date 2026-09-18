@@ -162,6 +162,7 @@ ARQUIVO_REGISTROS_PERSONAGENS = os.path.join(BASE_DIR, "registros_personagens.js
 ARQUIVO_TEMPLATES = os.path.join(BASE_DIR, "templates_mensagens.json")
 ARQUIVO_FICHAS_EM_ANALISE = os.path.join(BASE_DIR, "fichas_em_analise.json")
 ARQUIVO_CONFIG_VIDAS = os.path.join(BASE_DIR, "config_vidas.json")
+ARQUIVO_CONFIG_PAUSA_VIPS = os.path.join(BASE_DIR, "config_pausa_vips.json")
 ARQUIVO_VERSAO_BOT = os.path.join(BASE_DIR, "versao_bot.json")
 ARQUIVO_CONFIG_ABERTURA = os.path.join(BASE_DIR, "config_abertura.json")
 ARQUIVO_CONFIG_TICKETS = os.path.join(BASE_DIR, "config_tickets.json")
@@ -280,6 +281,21 @@ def carregar_vips():
 
 def salvar_vips(dados):
     salvar_json_seguro(ARQUIVO_VIPS, dados)
+
+def carregar_config_pausa_vips():
+    config = carregar_json_seguro(ARQUIVO_CONFIG_PAUSA_VIPS, {})
+    if not isinstance(config, dict):
+        config = {}
+    return {
+        "pausado": bool(config.get("pausado", False)),
+        "iniciado_em": config.get("iniciado_em"),
+    }
+
+def salvar_config_pausa_vips(config):
+    salvar_json_seguro(ARQUIVO_CONFIG_PAUSA_VIPS, config, ensure_ascii=False)
+
+def vips_estao_pausados():
+    return carregar_config_pausa_vips()["pausado"]
 
 def carregar_paineis():
     return carregar_json_seguro(ARQUIVO_PAINEIS, {})
@@ -3719,6 +3735,9 @@ async def agendar_remocao_vip(guild_id, user_id, cargo_id, canal_id, segundos_es
     try:
         await asyncio.sleep(segundos_espera)
 
+        if vips_estao_pausados():
+            return
+
         vips = carregar_vips()
         if vips.get(chave_vip) != vencimento_esperado:
             return
@@ -3791,12 +3810,19 @@ async def conceder_vip_temporario(guild, membro, cargo, quantidade, unidade, can
         raise ValueError("A quantidade precisa ser maior que zero.")
 
     await membro.add_roles(cargo, reason=motivo)
+    # VIP concedido durante a pausa deve receber a duracao inteira depois da
+    # retomada, e nao ganhar retroativamente todo o tempo pausado anterior.
+    base_vencimento = datetime.now()
+    pausa = carregar_config_pausa_vips()
+    if pausa["pausado"] and pausa["iniciado_em"]:
+        with suppress(TypeError, ValueError):
+            base_vencimento = datetime.fromisoformat(pausa["iniciado_em"])
     if "minuto" in unidade.lower():
         segundos_totais = quantidade * 60
-        vencimento = datetime.now() + timedelta(minutes=quantidade)
+        vencimento = base_vencimento + timedelta(minutes=quantidade)
     else:
         segundos_totais = quantidade * 24 * 60 * 60
-        vencimento = datetime.now() + timedelta(days=quantidade)
+        vencimento = base_vencimento + timedelta(days=quantidade)
     vips = carregar_vips()
     prefixo_chave = f"{membro.id}_{cargo.id}_"
 
@@ -3817,6 +3843,30 @@ async def conceder_vip_temporario(guild, membro, cargo, quantidade, unidade, can
         segundos_totais, chave_vip, vencimento_iso,
     )
     return vencimento
+
+def cancelar_agendamentos_vips():
+    """Para todos os relogios em memoria sem apagar os vencimentos salvos."""
+    for tarefa in list(tarefas_remocao_vip.values()):
+        if tarefa and not tarefa.done():
+            tarefa.cancel()
+    tarefas_remocao_vip.clear()
+
+def reagendar_vips_ativos():
+    """Recria os relogios dos VIPs a partir dos vencimentos persistidos."""
+    agora = datetime.now()
+    for chave, vencimento_str in carregar_vips().items():
+        try:
+            user_id, cargo_id, canal_id = map(int, chave.split("_", 2))
+            vencimento = datetime.fromisoformat(vencimento_str)
+            guild = next((item for item in bot.guilds if item.get_role(cargo_id)), None)
+            if not guild:
+                continue
+            agendar_remocao_vip_unica(
+                guild.id, user_id, cargo_id, canal_id,
+                max(0, (vencimento - agora).total_seconds()), chave, vencimento_str,
+            )
+        except (TypeError, ValueError):
+            print(f"[VIP] Registro invalido ignorado ao reagendar: {chave}")
 
 async def monitorar_mortes():
     if not CANAL_MORTES_ID: return
@@ -6034,9 +6084,58 @@ async def listar_vips(interaction: discord.Interaction):
     vips = carregar_vips()
     if not vips: return await interaction.response.send_message("Nenhum VIP.", ephemeral=True)
     texto = "**📋 Lista VIPs:**\n"
+    if vips_estao_pausados():
+        texto += "⏸ **Tempo dos VIPs pausado globalmente.**\n"
     for chave, data_str in vips.items():
         texto += f"• <@{chave.split('_')[0]}> expira: `{datetime.fromisoformat(data_str).strftime('%d/%m/%Y %H:%M:%S')}`\n"
     await interaction.response.send_message(texto, ephemeral=True)
+
+@bot.tree.command(name="tempo_vips", description="Pausa ou retoma o tempo de todos os VIPs ativos")
+@app_commands.describe(pausar="True pausa todos os VIPs; False retoma a contagem")
+@app_commands.default_permissions(administrator=True)
+async def tempo_vips(interaction: discord.Interaction, pausar: bool):
+    """Congela todos os vencimentos e conserva exatamente o tempo restante."""
+    if await bloquear_se_nao_for_staff(interaction):
+        return
+
+    config = carregar_config_pausa_vips()
+    if pausar:
+        if config["pausado"]:
+            return await interaction.response.send_message("⏸ O tempo dos VIPs ja esta pausado.", ephemeral=True)
+        config = {"pausado": True, "iniciado_em": datetime.now().isoformat()}
+        salvar_config_pausa_vips(config)
+        cancelar_agendamentos_vips()
+        return await interaction.response.send_message(
+            f"⏸ Tempo de **{len(carregar_vips())} VIP(s)** pausado. Os cargos permanecem ativos e nenhum prazo correra ate voce retomar.",
+            ephemeral=True,
+        )
+
+    if not config["pausado"]:
+        return await interaction.response.send_message("▶ O tempo dos VIPs ja esta correndo.", ephemeral=True)
+
+    try:
+        inicio_pausa = datetime.fromisoformat(config["iniciado_em"])
+    except (TypeError, ValueError):
+        return await interaction.response.send_message(
+            "⚠ Nao consegui ler o inicio da pausa. O tempo continua pausado para evitar expiracoes erradas.",
+            ephemeral=True,
+        )
+
+    duracao_pausa = max(timedelta(), datetime.now() - inicio_pausa)
+    vips = carregar_vips()
+    for chave, vencimento_str in list(vips.items()):
+        try:
+            vips[chave] = (datetime.fromisoformat(vencimento_str) + duracao_pausa).isoformat()
+        except (TypeError, ValueError):
+            print(f"[VIP] Registro invalido ignorado ao retomar pausa: {chave}")
+    salvar_vips(vips)
+    salvar_config_pausa_vips({"pausado": False, "iniciado_em": None})
+    reagendar_vips_ativos()
+    minutos = int(duracao_pausa.total_seconds() // 60)
+    await interaction.response.send_message(
+        f"▶ Tempo de **{len(vips)} VIP(s)** retomado. Cada vencimento foi adiado por **{minutos} minuto(s)**, exatamente o periodo da pausa.",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="rcon", description="💻 Envia comando ao console")
 @app_commands.default_permissions(administrator=True)
@@ -6096,6 +6195,10 @@ async def on_ready():
         print(f"[FICHAS] {len(fila_inicial)} ficha(s) na fila duravel aguardando registro no servidor.")
         if not fila_pendentes_em_espera:
             agendar_processamento_fichas_pendentes()
+
+    if vips_estao_pausados():
+        print("[VIP] Tempo dos VIPs permanece pausado apos reinicio.")
+        return
 
     vips = carregar_vips()
     hoje = datetime.now()
