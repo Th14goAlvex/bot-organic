@@ -33,7 +33,9 @@ from rcon.source.proto import Packet, Type
 
 # --- 1. CARREGAR SEGREDOS E CAMINHOS ---
 print("--- INICIANDO ZOMBOIDOS V148 (RCON TEIMOSO COM TENTATIVAS MÚLTIPLAS) 🛡  ---")
-load_dotenv()
+# Arquivos exportados pelo Windows/painel podem comecar com BOM UTF-8.
+# Sem utf-8-sig, a primeira chave (frequentemente DISCORD_TOKEN) nao e lida.
+load_dotenv(encoding="utf-8-sig")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # O Llama 3.3 70B foi removido para chaves free/developer em 16/08/2026.
